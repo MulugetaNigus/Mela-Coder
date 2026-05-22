@@ -1,0 +1,25 @@
+.env
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# TypeScript build artifacts
+*.tsbuildinfo
+
+# Unrelated project files
+bean-and-bloom/
+docs/
+form.html
+index.html
+script.js
+style.css
+src/style.css
