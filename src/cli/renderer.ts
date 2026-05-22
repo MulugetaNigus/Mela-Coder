@@ -179,8 +179,9 @@ export class Renderer {
   private iterationStart = 0;
   private sessionStart = 0;
   private modelResponded = false;
-  private streamHasNewline = false;
   private streamBuffer = '';
+  private lastFlushedIndex = 0;
+  private streamStarted = false;
 
   constructor(private debug = false) {}
 
@@ -268,24 +269,49 @@ export class Renderer {
         }
         break;
       case 'stream_start':
-        this.streamHasNewline = false;
         this.streamBuffer = '';
+        this.lastFlushedIndex = 0;
+        this.streamStarted = false;
         break;
-      case 'stream_chunk':
-        this.streamBuffer += event.content.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '');
-        break;
-      case 'stream_end':
-        if (this.streamBuffer) {
+      case 'stream_chunk': {
+        const text = event.content.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '');
+        this.streamBuffer += text;
+        let newlineIdx;
+        while ((newlineIdx = this.streamBuffer.indexOf('\n', this.lastFlushedIndex)) !== -1) {
           this.stopSpinner();
           this.hasVisibleOutput = true;
           this.modelResponded = true;
-          const rendered = renderMarkdown(this.streamBuffer, chalk);
-          process.stdout.write(`\n  ${rendered}`);
-          if (!rendered.endsWith('\n')) process.stdout.write('\n');
+          const line = this.streamBuffer.slice(this.lastFlushedIndex, newlineIdx);
+          if (!this.streamStarted) {
+            process.stdout.write(`\n  `);
+            this.streamStarted = true;
+          }
+          process.stdout.write(renderMarkdown(line, chalk) + '\n');
+          this.lastFlushedIndex = newlineIdx + 1;
+        }
+        break;
+      }
+      case 'stream_end': {
+        const remaining = this.streamBuffer.slice(this.lastFlushedIndex);
+        if (remaining || !this.streamStarted) {
+          this.stopSpinner();
+          this.hasVisibleOutput = true;
+          this.modelResponded = true;
+          if (!this.streamStarted) {
+            process.stdout.write(`\n  `);
+            this.streamStarted = true;
+          }
+          process.stdout.write(renderMarkdown(remaining, chalk));
+        }
+        if (this.streamStarted) {
+          if (remaining) process.stdout.write('\n');
           process.stdout.write('\n');
         }
         this.streamBuffer = '';
+        this.lastFlushedIndex = 0;
+        this.streamStarted = false;
         break;
+      }
       case 'text': {
         this.stopSpinner();
         if (!this.hasVisibleOutput) {
@@ -310,13 +336,15 @@ export class Renderer {
         const isCmd = event.name === 'execute_bash' || event.name === 'run_cmd';
         const isSearch = event.name === 'glob' || event.name === 'search_files' || event.name === 'grep' || event.name === 'find_files';
         const prefix = isCmd ? chalk.yellow('$') : isSearch ? chalk.magenta('✱') : chalk.cyan('→');
-        process.stdout.write(`  ${prefix} ${chalk.bold(label)}\n`);
-        if (this.debug) {
-          const params = Object.entries(event.params)
-            .map(([key, value]) => `    ${chalk.dim(key)}: ${chalk.gray(formatParamValue(value))}`)
-            .join('\n');
-          if (params) process.stdout.write(`${params}\n`);
+        const skipKeys = new Set(['file_path', 'path', 'cmd', 'command', 'pattern', 'content', 'old_string', 'new_string', 'url']);
+        const paramParts: string[] = [];
+        for (const [key, value] of Object.entries(event.params)) {
+          if (skipKeys.has(key)) continue;
+          const formatted = formatParamValue(value);
+          if (formatted) paramParts.push(`${key}=${formatted}`);
         }
+        const paramStr = paramParts.length > 0 ? ` [${paramParts.join(', ')}]` : '';
+        process.stdout.write(`  ${prefix} ${chalk.bold(label)}${chalk.dim(paramStr)}\n`);
         this.startSpinner();
         break;
       }
@@ -327,38 +355,37 @@ export class Renderer {
         const icon = event.success ? chalk.green('✓') : chalk.red('✗');
         const nameColor = event.success ? chalk.green(event.name) : chalk.red(event.name);
         process.stdout.write(`  ${icon} ${nameColor} ${chalk.dim(`· ${elapsed}`)}\n`);
-        const output = summarizeToolOutput(event.name, event.output, this.debug);
-        if (output) {
-          if (event.name === 'list_dir') {
-            process.stdout.write(`\n${formatFileTree(output, chalk)}\n\n`);
-          } else if (event.name === 'read_file') {
-            process.stdout.write(`\n${chalk.gray(output)}\n\n`);
-          } else if (event.name === 'edit_file' || event.name === 'str_replace') {
-            process.stdout.write(event.success ? `  ${output}\n` : `  ${chalk.red(output)}\n`);
-          } else if (event.name === 'execute_bash' || event.name === 'run_cmd') {
-            const cleanOutput = output
-              .replace(/^STDOUT:\n?/, '')
-              .replace(/^STDERR:\n?/, '')
-              .replace(/^Exit code: \d+\n?/, '')
-              .trim();
-            if (cleanOutput) {
-              process.stdout.write(`\n${chalk.gray(cleanOutput)}\n\n`);
+        const fileCrudOps = new Set(['read_file', 'write_file', 'edit_file', 'str_replace', 'delete_file']);
+        if (!fileCrudOps.has(event.name)) {
+          const output = summarizeToolOutput(event.name, event.output, this.debug);
+          if (output) {
+            if (event.name === 'list_dir') {
+              process.stdout.write(`\n${formatFileTree(output, chalk)}\n\n`);
+            } else if (event.name === 'execute_bash' || event.name === 'run_cmd') {
+              const cleanOutput = output
+                .replace(/^STDOUT:\n?/, '')
+                .replace(/^STDERR:\n?/, '')
+                .replace(/^Exit code: \d+\n?/, '')
+                .trim();
+              if (cleanOutput) {
+                process.stdout.write(`\n${chalk.gray(cleanOutput)}\n\n`);
+              }
+            } else if (event.name === 'web_search') {
+              const results = output.split('\n\n');
+              for (const r of results) {
+                const lines = r.split('\n').filter(l => l.trim());
+                if (lines.length === 0) continue;
+                const title = lines[0];
+                const url = lines.length > 1 ? lines[1] : '';
+                const snippet = lines.length > 2 ? lines.slice(2).join('\n') : '';
+                if (title) process.stdout.write(`  ${title}\n`);
+                if (url) process.stdout.write(`  ${chalk.dim(url)}\n`);
+                if (snippet) process.stdout.write(`  ${chalk.gray(snippet)}\n`);
+                process.stdout.write('\n');
+              }
+            } else {
+              process.stdout.write(`\n${chalk.gray(output)}\n\n`);
             }
-          } else if (event.name === 'web_search') {
-            const results = output.split('\n\n');
-            for (const r of results) {
-              const lines = r.split('\n').filter(l => l.trim());
-              if (lines.length === 0) continue;
-              const title = lines[0];
-              const url = lines.length > 1 ? lines[1] : '';
-              const snippet = lines.length > 2 ? lines.slice(2).join('\n') : '';
-              if (title) process.stdout.write(`  ${title}\n`);
-              if (url) process.stdout.write(`  ${chalk.dim(url)}\n`);
-              if (snippet) process.stdout.write(`  ${chalk.gray(snippet)}\n`);
-              process.stdout.write('\n');
-            }
-          } else {
-            process.stdout.write(`\n${chalk.gray(output)}\n\n`);
           }
         }
         this.iterationStart = Date.now();
@@ -368,14 +395,11 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = false;
         this.modelResponded = false;
-        this.streamHasNewline = false;
         process.stdout.write('\n');
         break;
       }
-      case 'cache_summary': {
-        process.stdout.write(`  ${chalk.green('✓')} Session: ~${event.inputTokens + event.outputTokens} estimated tokens used (${chalk.green(`saved ~${event.savedTokens} tokens`)} via caching)\n\n`);
+      case 'cache_summary':
         break;
-      }
       case 'step': {
         this.stopSpinner();
         this.modelResponded = true;
