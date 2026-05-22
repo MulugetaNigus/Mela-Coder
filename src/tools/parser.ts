@@ -285,6 +285,12 @@ function parseFencedToolParams(name: string, content: string): Record<string, st
     case 'task_notes':
       return { action: 'read', content: stripParamLabel(trimmed) };
 
+    case 'write_todos':
+      return { todos: stripParamLabel(trimmed) };
+
+    case 'suggest_followups':
+      return { followups: stripParamLabel(trimmed) };
+
     default: {
       if (typeof trimmed === 'string' && trimmed) {
         return { content: stripParamLabel(trimmed) };

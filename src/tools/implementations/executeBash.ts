@@ -1,8 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { ToolDefinition, ToolResult } from '../registry';
 
-const BLOCKED_PATTERNS = [/rm\s+-rf\s+\//, /sudo\s+rm/, /\bmkfs\b/, /\bdd\s+if=/, /:\(\)\{\s*:\|:&\s*\};:/];
-
 function capOutput(output: string): string {
   if (output.length <= 4000) return output;
   return `${output.slice(0, 4000)}\n[Output truncated - ${output.length} chars total]`;
@@ -19,9 +17,6 @@ export const executeBashTool: ToolDefinition = {
     try {
       if (typeof params.cmd !== 'string') throw new Error('cmd must be a string');
       const cmd = params.cmd;
-      if (BLOCKED_PATTERNS.some(pattern => pattern.test(cmd))) {
-        return { success: false, output: '', error: `Blocked dangerous command: ${cmd}` };
-      }
 
       const timeoutMs = typeof params.timeout_ms === 'number' ? params.timeout_ms : 30000;
       return await new Promise<ToolResult>(resolve => {

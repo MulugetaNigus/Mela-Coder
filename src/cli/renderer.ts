@@ -125,6 +125,11 @@ function renderToolCallPrefix(name: string, params: Record<string, unknown>): st
 function renderMarkdown(text: string, chalk: ChalkLike): string {
   let result = text;
 
+  // Normalize list indentation: strip leading whitespace from list marker lines
+  // so consecutive items align consistently regardless of model formatting
+  result = result.replace(/^[ \t]+(?=[-*+]\s)/gm, '');
+  result = result.replace(/^[ \t]+(?=\d+\.\s)/gm, '');
+
   // Headers first
   result = result.replace(/^######\s+(.+)$/gm, chalk.dim('$1'));
   result = result.replace(/^#####\s+(.+)$/gm, chalk.bold(chalk.dim('$1')));
@@ -139,8 +144,7 @@ function renderMarkdown(text: string, chalk: ChalkLike): string {
 
   // List bullets (handle leading whitespace)
   result = result.replace(/^(\s*)[-*+]\s+/gm, (_, indent) => indent + chalk.cyan('•') + ' ');
-  result = result.replace(/^(\s*)\d+\.\s+/gm, (_, indent, match) => {
-    const num = match.trim().replace(/\.$/, '');
+  result = result.replace(/^(\s*)(\d+)\.\s+/gm, (_, indent, num) => {
     return indent + chalk.cyan(num + '. ');
   });
 
@@ -176,6 +180,7 @@ export class Renderer {
   private sessionStart = 0;
   private modelResponded = false;
   private streamHasNewline = false;
+  private streamBuffer = '';
 
   constructor(private debug = false) {}
 
@@ -264,25 +269,22 @@ export class Renderer {
         break;
       case 'stream_start':
         this.streamHasNewline = false;
+        this.streamBuffer = '';
         break;
-      case 'stream_chunk': {
-        this.stopSpinner();
-        this.hasVisibleOutput = true;
-        this.modelResponded = true;
-        const cleaned = event.content.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '');
-        const rendered = renderMarkdown(cleaned, chalk);
-        if (!this.streamHasNewline) {
-          process.stdout.write('\n');
-          this.streamHasNewline = true;
-        }
-        process.stdout.write(rendered);
-        if (rendered.endsWith('\n')) {
-          this.streamHasNewline = false;
-        }
+      case 'stream_chunk':
+        this.streamBuffer += event.content.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '');
         break;
-      }
       case 'stream_end':
-        process.stdout.write('\n');
+        if (this.streamBuffer) {
+          this.stopSpinner();
+          this.hasVisibleOutput = true;
+          this.modelResponded = true;
+          const rendered = renderMarkdown(this.streamBuffer, chalk);
+          process.stdout.write(`\n  ${rendered}`);
+          if (!rendered.endsWith('\n')) process.stdout.write('\n');
+          process.stdout.write('\n');
+        }
+        this.streamBuffer = '';
         break;
       case 'text': {
         this.stopSpinner();
@@ -342,6 +344,19 @@ export class Renderer {
             if (cleanOutput) {
               process.stdout.write(`\n${chalk.gray(cleanOutput)}\n\n`);
             }
+          } else if (event.name === 'web_search') {
+            const results = output.split('\n\n');
+            for (const r of results) {
+              const lines = r.split('\n').filter(l => l.trim());
+              if (lines.length === 0) continue;
+              const title = lines[0];
+              const url = lines.length > 1 ? lines[1] : '';
+              const snippet = lines.length > 2 ? lines.slice(2).join('\n') : '';
+              if (title) process.stdout.write(`  ${title}\n`);
+              if (url) process.stdout.write(`  ${chalk.dim(url)}\n`);
+              if (snippet) process.stdout.write(`  ${chalk.gray(snippet)}\n`);
+              process.stdout.write('\n');
+            }
           } else {
             process.stdout.write(`\n${chalk.gray(output)}\n\n`);
           }
@@ -355,6 +370,37 @@ export class Renderer {
         this.modelResponded = false;
         this.streamHasNewline = false;
         process.stdout.write('\n');
+        break;
+      }
+      case 'cache_summary': {
+        process.stdout.write(`  ${chalk.green('✓')} Session: ~${event.inputTokens + event.outputTokens} estimated tokens used (${chalk.green(`saved ~${event.savedTokens} tokens`)} via caching)\n\n`);
+        break;
+      }
+      case 'step': {
+        this.stopSpinner();
+        this.modelResponded = true;
+        if (event.content.includes('✓') || event.content.includes('✗')) {
+          const parts = event.content.split('·').map(part => {
+            const trimmed = part.trim();
+            const match = trimmed.match(/^([✓✗])\s*([a-zA-Z0-9_\-\s\(\)]+?)(?:\s+(\d+(?:\.\d+)?s))?$/);
+            if (match) {
+              const [, symbol, name, duration] = match;
+              const symColor = symbol === '✓' ? chalk.green('✓') : chalk.red('✗');
+              const nameColor = symbol === '✓' ? chalk.dim(name.trim()) : chalk.red(name.trim());
+              const durColor = duration ? chalk.gray(` ${duration}`) : '';
+              return `${symColor} ${nameColor}${durColor}`;
+            }
+            if (trimmed.startsWith('✓')) {
+              return `${chalk.green('✓')} ${chalk.dim(trimmed.slice(1).trim())}`;
+            } else if (trimmed.startsWith('✗')) {
+              return `${chalk.red('✗')} ${chalk.red(trimmed.slice(1).trim())}`;
+            }
+            return chalk.dim(trimmed);
+          });
+          process.stdout.write(`  ${parts.join(chalk.dim(' · '))} \n`);
+        } else {
+          process.stdout.write(`  ${chalk.dim('•')} ${chalk.dim(event.content)}\n`);
+        }
         break;
       }
       case 'error': {

@@ -11,13 +11,14 @@ import { recallTool, rememberTool, summarizeContextTool, taskNotesTool } from '.
 import { readFileTool } from './implementations/readFile';
 import { searchFilesTool } from './implementations/searchFiles';
 import { generateComponentTool } from './implementations/generateComponent';
-import { spawnAgentsTool, getAgentTypesTool } from './implementations/spawnAgents';
+import { spawnAgentsTool, getAgentTypesTool, dispatchSubtasksTool } from './implementations/spawnAgents';
 import { strReplaceTool } from './implementations/strReplace';
 import { suggestFollowupsTool } from './implementations/suggestFollowups';
 import { doneTool, showDiffTool } from './implementations/uxTools';
 import { fetchUrlTool, readGithubFileTool, readGithubIssueTool, webSearchTool } from './implementations/webTools';
 import { writeFileTool } from './implementations/writeFile';
 import { writeTodosTool } from './implementations/writeTodos';
+import { createGetToolDefinitionsTool } from './implementations/toolDefinitions';
 import { ToolRegistry } from './registry';
 
 export function createDefaultRegistry(): ToolRegistry {
@@ -71,5 +72,7 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(globTool);
   registry.register(spawnAgentsTool);
   registry.register(getAgentTypesTool);
+  registry.register(dispatchSubtasksTool);
+  registry.register(createGetToolDefinitionsTool(registry));
   return registry;
 }

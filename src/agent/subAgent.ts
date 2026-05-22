@@ -19,6 +19,7 @@ export interface SubAgentResult {
   output: string;
   error?: string;
   metadata?: Record<string, unknown>;
+  filesModified?: string[];
 }
 
 /**
@@ -140,6 +141,7 @@ export async function runSubAgent(
   let iterations = 0;
   const MAX = definition.maxIterations;
   let lastOutput = '';
+  const filesModified: string[] = [];
 
   while (iterations < MAX) {
     iterations++;
@@ -186,7 +188,18 @@ export async function runSubAgent(
             : (typeof parsed.toolCall.params.message === 'string'
               ? parsed.toolCall.params.message
               : JSON.stringify(parsed.toolCall.params));
-          return { agentType: spec.agentType, success: true, output };
+          return { agentType: spec.agentType, success: true, output, filesModified };
+        }
+
+        const toolName = parsed.toolCall.name;
+        if (['write_file', 'edit_file', 'str_replace', 'delete_file'].includes(toolName)) {
+          const file = parsed.toolCall.params.path ?? parsed.toolCall.params.file_path ?? parsed.toolCall.params.target_file;
+          if (typeof file === 'string') {
+            const absPath = path.resolve(process.cwd(), file);
+            if (!filesModified.includes(absPath)) {
+              filesModified.push(absPath);
+            }
+          }
         }
 
         const result = await executeTool(parsed.toolCall, registry);
@@ -201,7 +214,8 @@ export async function runSubAgent(
         agentType: spec.agentType,
         success: false,
         output: lastOutput,
-        error: err?.message ?? 'Sub-agent execution failed'
+        error: err?.message ?? 'Sub-agent execution failed',
+        filesModified
       };
     }
   }
@@ -210,7 +224,8 @@ export async function runSubAgent(
     agentType: spec.agentType,
     success: lastOutput.length > 0,
     output: lastOutput || 'Sub-agent reached max iterations without producing output.',
-    error: lastOutput ? undefined : `Reached max iterations (${MAX})`
+    error: lastOutput ? undefined : `Reached max iterations (${MAX})`,
+    filesModified
   };
 }
 

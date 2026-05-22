@@ -1,6 +1,7 @@
 import { promises as fs } from 'node:fs';
 import type { ToolDefinition, ToolResult } from '../registry';
 import { renderDiff, resolveWorkspacePath } from './toolUtils';
+import { promptDiff } from '../../ui/diff';
 
 export const strReplaceTool: ToolDefinition = {
   name: 'str_replace',
@@ -23,9 +24,9 @@ export const strReplaceTool: ToolDefinition = {
       if (typeof params.newString !== 'string') throw new Error('newString must be a string (can be empty)');
 
       const resolvedPath = resolveWorkspacePath(filePath);
-      let content = await fs.readFile(resolvedPath, 'utf8');
+      const oldContent = await fs.readFile(resolvedPath, 'utf8');
 
-      const count = content.split(oldString).length - 1;
+      const count = oldContent.split(oldString).length - 1;
       if (count === 0) {
         return { success: false, output: '', error: `oldString was not found in file: ${JSON.stringify(oldString.slice(0, 100))}` };
       }
@@ -34,14 +35,23 @@ export const strReplaceTool: ToolDefinition = {
         return { success: false, output: '', error: `oldString matched ${count} times. Set allowMultiple=true or provide a more specific string.` };
       }
 
+      let newContent = '';
       if (allowMultiple) {
-        content = content.split(oldString).join(newString);
+        newContent = oldContent.split(oldString).join(newString);
       } else {
-        content = content.replace(oldString, newString);
+        newContent = oldContent.replace(oldString, newString);
+      }
+
+      const decision = await promptDiff(oldContent, newContent, filePath);
+      if (decision === 'skip') {
+        return { success: false, output: '', error: `[SKIPPED] User declined applying the changes to ${filePath}` };
+      }
+      if (decision === 'abort') {
+        return { success: false, output: '', error: `[ABORTED] User aborted the modification to ${filePath}` };
       }
 
       const tmpPath = `${resolvedPath}.tmp`;
-      await fs.writeFile(tmpPath, content, 'utf8');
+      await fs.writeFile(tmpPath, newContent, 'utf8');
       await fs.rename(tmpPath, resolvedPath);
 
       const occurrences = allowMultiple ? count : 1;

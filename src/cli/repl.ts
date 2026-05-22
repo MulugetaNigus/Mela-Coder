@@ -1,6 +1,8 @@
 import readline from 'node:readline';
 import type { AgentSession } from '../agent/loop';
 import { Renderer } from './renderer';
+import { ProjectMemory } from '../memory/project';
+import { SkillLoader } from '../skills/loader';
 
 export async function startRepl(agent: AgentSession, renderer: Renderer): Promise<void> {
   let debug = false;
@@ -41,6 +43,37 @@ export async function startRepl(agent: AgentSession, renderer: Renderer): Promis
       agent.setDebug(debug);
       renderer.setDebug(debug);
       process.stdout.write(`Debug ${debug ? 'enabled' : 'disabled'}.\n`);
+      rl.prompt();
+      continue;
+    }
+    if (input.startsWith('/memory')) {
+      const parts = input.split(/\s+/);
+      const sub = parts[1];
+      if (sub === 'init') {
+        const targetPath = ProjectMemory.init();
+        process.stdout.write(`✓ Project memory initialized at ${targetPath}\n`);
+      } else {
+        const mem = ProjectMemory.load();
+        if (!mem) {
+          process.stdout.write('⚠️ No project memory found. Use /memory init to initialize one.\n');
+        } else {
+          process.stdout.write(`\n--- MELA.md Project Memory ---\n${mem}\n-----------------------------\n`);
+        }
+      }
+      rl.prompt();
+      continue;
+    }
+    if (input.startsWith('/skills')) {
+      const skills = SkillLoader.discoverSkills();
+      if (skills.length === 0) {
+        process.stdout.write('⚠️ No skills discovered in src/skills/\n');
+      } else {
+        process.stdout.write('\n--- Discovered Skills ---\n');
+        for (const skill of skills) {
+          process.stdout.write(`- ${skill.name}: trigger patterns: ${skill.triggers.toString()}\n`);
+        }
+        process.stdout.write('-------------------------\n');
+      }
       rl.prompt();
       continue;
     }
