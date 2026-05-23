@@ -179,31 +179,33 @@ export async function runSubAgent(
         continue;
       }
 
-      if (parsed.toolCall) {
+      if (parsed.toolCalls && parsed.toolCalls.length > 0) {
         history.push({ role: 'assistant', content: raw });
 
-        if (parsed.toolCall.name === 'set_output') {
-          const output = typeof parsed.toolCall.params.data === 'object'
-            ? JSON.stringify(parsed.toolCall.params.data, null, 2)
-            : (typeof parsed.toolCall.params.message === 'string'
-              ? parsed.toolCall.params.message
-              : JSON.stringify(parsed.toolCall.params));
-          return { agentType: spec.agentType, success: true, output, filesModified };
-        }
+        for (const toolCall of parsed.toolCalls) {
+          if (toolCall.name === 'set_output') {
+            const output = typeof toolCall.params.data === 'object'
+              ? JSON.stringify(toolCall.params.data, null, 2)
+              : (typeof toolCall.params.message === 'string'
+                ? toolCall.params.message
+                : JSON.stringify(toolCall.params));
+            return { agentType: spec.agentType, success: true, output, filesModified };
+          }
 
-        const toolName = parsed.toolCall.name;
-        if (['write_file', 'edit_file', 'str_replace', 'delete_file'].includes(toolName)) {
-          const file = parsed.toolCall.params.path ?? parsed.toolCall.params.file_path ?? parsed.toolCall.params.target_file;
-          if (typeof file === 'string') {
-            const absPath = path.resolve(process.cwd(), file);
-            if (!filesModified.includes(absPath)) {
-              filesModified.push(absPath);
+          const toolName = toolCall.name;
+          if (['write_file', 'edit_file', 'str_replace', 'delete_file'].includes(toolName)) {
+            const file = toolCall.params.path ?? toolCall.params.file_path ?? toolCall.params.target_file;
+            if (typeof file === 'string') {
+              const absPath = path.resolve(process.cwd(), file);
+              if (!filesModified.includes(absPath)) {
+                filesModified.push(absPath);
+              }
             }
           }
-        }
 
-        const result = await executeTool(parsed.toolCall, registry);
-        history.push({ role: 'user', content: formatToolResult(parsed.toolCall.name, result) });
+          const result = await executeTool(toolCall, registry);
+          history.push({ role: 'user', content: formatToolResult(toolCall.name, result) });
+        }
         continue;
       }
 

@@ -165,10 +165,11 @@ const LOADING_FRAMES = [
 ];
 
 const LOADING_LABELS = [
-  'thinking',
-  'processing',
-  'analyzing',
-  'working',
+  'orchestrating sub-agents',
+  'analyzing workspace',
+  'compiling context',
+  'synthesizing edits',
+  'formulating execution plan'
 ];
 
 export class Renderer {
@@ -182,6 +183,9 @@ export class Renderer {
   private streamBuffer = '';
   private lastFlushedIndex = 0;
   private streamStarted = false;
+  private toolCallPrefix = '';
+  private toolCallLabel = '';
+  private toolCallParamStr = '';
 
   constructor(private debug = false) {}
 
@@ -252,7 +256,7 @@ export class Renderer {
         this.modelResponded = true;
         const content = event.content.trim();
         if (content) {
-          process.stdout.write(`  ${chalk.dim('·')} ${chalk.dim(content)}\n`);
+          process.stdout.write(`  ${chalk.blue('thinking')} ${chalk.dim('·')} ${chalk.gray(content)}\n`);
         }
         break;
       }
@@ -260,13 +264,12 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         this.modelResponded = true;
-        process.stdout.write(`  ${chalk.dim(event.content)}\n`);
+        process.stdout.write(`  ${chalk.dim('·')} ${chalk.dim(event.content)}\n`);
         break;
       }
       case 'status':
-        if (this.debug) {
-          process.stdout.write(chalk.dim(`\n  [${event.content}]\n`));
-        }
+        this.stopSpinner();
+        process.stdout.write(`  ${chalk.cyan('i')} ${chalk.dim(event.content)}\n`);
         break;
       case 'stream_start':
         this.streamBuffer = '';
@@ -332,19 +335,36 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         this.modelResponded = true;
-        const label = renderToolCallPrefix(event.name, event.params);
+        
         const isCmd = event.name === 'execute_bash' || event.name === 'run_cmd';
         const isSearch = event.name === 'glob' || event.name === 'search_files' || event.name === 'grep' || event.name === 'find_files';
-        const prefix = isCmd ? chalk.yellow('$') : isSearch ? chalk.magenta('✱') : chalk.cyan('→');
-        const skipKeys = new Set(['file_path', 'path', 'cmd', 'command', 'pattern', 'content', 'old_string', 'new_string', 'url']);
-        const paramParts: string[] = [];
+        const color = isCmd ? chalk.yellow : isSearch ? chalk.magenta : chalk.cyan;
+        const icon = isCmd ? '>' : isSearch ? '?' : '*';
+        
+        process.stdout.write(`\n  ${color(icon)} ${chalk.bold(event.name)}\n`);
+        
+        const pathStr = (event.params.path ?? event.params.file_path ?? event.params.target_file ?? '') as string;
+        if (pathStr) {
+          process.stdout.write(`  ${color('|')} ${chalk.dim('path:')} ${chalk.white(pathStr)}\n`);
+        }
+        const cmdStr = (event.params.cmd ?? event.params.command ?? '') as string;
+        if (cmdStr) {
+          process.stdout.write(`  ${color('|')} ${chalk.dim('command:')} ${chalk.yellow(cmdStr.trim())}\n`);
+        }
+        
+        const skipKeys = new Set(['content', 'old_string', 'new_string', 'oldString', 'newString', 'cmd', 'command', 'path', 'file_path']);
         for (const [key, value] of Object.entries(event.params)) {
           if (skipKeys.has(key)) continue;
           const formatted = formatParamValue(value);
-          if (formatted) paramParts.push(`${key}=${formatted}`);
+          if (formatted) {
+            process.stdout.write(`  ${color('|')} ${chalk.dim(key + ':')} ${formatted}\n`);
+          }
         }
-        const paramStr = paramParts.length > 0 ? ` [${paramParts.join(', ')}]` : '';
-        process.stdout.write(`  ${prefix} ${chalk.bold(label)}${chalk.dim(paramStr)}\n`);
+        
+        this.toolCallPrefix = color('|');
+        this.toolCallLabel = event.name;
+        this.toolCallParamStr = pathStr || cmdStr ? ` (${pathStr || cmdStr})` : '';
+        
         this.startSpinner();
         break;
       }
@@ -352,15 +372,24 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         const elapsed = this.elapsed();
-        const icon = event.success ? chalk.green('✓') : chalk.red('✗');
-        const nameColor = event.success ? chalk.green(event.name) : chalk.red(event.name);
-        process.stdout.write(`  ${icon} ${nameColor} ${chalk.dim(`· ${elapsed}`)}\n`);
+        const color = event.success ? chalk.green : chalk.red;
+        const statusSymbol = event.success ? '+' : '-';
+        
+        process.stdout.write(`  ${color(statusSymbol)} ${chalk.bold(this.toolCallLabel)}${chalk.dim(this.toolCallParamStr)} completed ${chalk.dim(`· ${elapsed}`)}\n`);
+        
         const fileCrudOps = new Set(['read_file', 'write_file', 'edit_file', 'str_replace', 'delete_file']);
         if (!fileCrudOps.has(event.name)) {
           const output = summarizeToolOutput(event.name, event.output, this.debug);
           if (output) {
             if (event.name === 'list_dir') {
-              process.stdout.write(`\n${formatFileTree(output, chalk)}\n\n`);
+              const tree = formatFileTree(output, chalk);
+              const treeLines = tree.split('\n');
+              const displayTree = treeLines.length > 5 
+                ? `${treeLines.slice(0, 5).join('\n')}\n${chalk.dim('...')}`
+                : tree;
+              
+              const formattedTree = displayTree.split('\n').map(line => `  ${color('|')} ${line}`).join('\n');
+              process.stdout.write(`${formattedTree}\n`);
             } else if (event.name === 'execute_bash' || event.name === 'run_cmd') {
               const cleanOutput = output
                 .replace(/^STDOUT:\n?/, '')
@@ -368,7 +397,8 @@ export class Renderer {
                 .replace(/^Exit code: \d+\n?/, '')
                 .trim();
               if (cleanOutput) {
-                process.stdout.write(`\n${chalk.gray(cleanOutput)}\n\n`);
+                const formattedOut = cleanOutput.split('\n').map(line => `  ${color('|')} ${chalk.gray(line)}`).join('\n');
+                process.stdout.write(`${formattedOut}\n`);
               }
             } else if (event.name === 'web_search') {
               const results = output.split('\n\n');
@@ -378,16 +408,18 @@ export class Renderer {
                 const title = lines[0];
                 const url = lines.length > 1 ? lines[1] : '';
                 const snippet = lines.length > 2 ? lines.slice(2).join('\n') : '';
-                if (title) process.stdout.write(`  ${title}\n`);
-                if (url) process.stdout.write(`  ${chalk.dim(url)}\n`);
-                if (snippet) process.stdout.write(`  ${chalk.gray(snippet)}\n`);
-                process.stdout.write('\n');
+                
+                process.stdout.write(`  ${color('|')} ${chalk.bold(title)}\n`);
+                if (url) process.stdout.write(`  ${color('|')}   ${chalk.dim(url)}\n`);
+                if (snippet) process.stdout.write(`  ${color('|')}   ${chalk.gray(snippet)}\n`);
               }
             } else {
-              process.stdout.write(`\n${chalk.gray(output)}\n\n`);
+              const formattedOut = output.split('\n').map(line => `  ${color('|')} ${chalk.gray(line)}`).join('\n');
+              process.stdout.write(`${formattedOut}\n`);
             }
           }
         }
+        process.stdout.write('\n');
         this.iterationStart = Date.now();
         break;
       }
@@ -442,15 +474,17 @@ export class Renderer {
       }
       case 'todo': {
         this.stopSpinner();
+        process.stdout.write(`  ${chalk.bold('Task Checklist:')}\n`);
         for (const item of event.items) {
           if (item.status === 'completed') {
-            process.stdout.write(`  ${chalk.green('✓')} ${chalk.dim(item.content)}\n`);
+            process.stdout.write(`    ${chalk.green('+')} ${chalk.dim(item.content)}\n`);
           } else if (item.status === 'in_progress') {
-            process.stdout.write(`  ${chalk.yellow('●')} ${chalk.white(item.content)}\n`);
+            process.stdout.write(`    ${chalk.cyan('>')} ${chalk.bold(chalk.white(item.content))}\n`);
           } else {
-            process.stdout.write(`  ${chalk.dim('○')} ${chalk.dim(item.content)}\n`);
+            process.stdout.write(`    ${chalk.dim('-')} ${chalk.gray(item.content)}\n`);
           }
         }
+        process.stdout.write('\n');
         break;
       }
     }

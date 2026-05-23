@@ -6,6 +6,7 @@ export interface ParsedToolCall {
 export interface ParseResult {
   thinking: string | null;
   toolCall: ParsedToolCall | null;
+  toolCalls: ParsedToolCall[];
   text: string | null;
   isDone: boolean;
   isError: string | null;
@@ -35,6 +36,7 @@ export function parseModelResponse(raw: string): ParseResult {
     return {
       thinking: null,
       toolCall: null,
+      toolCalls: [],
       text: null,
       isDone: false,
       isError: `Invalid model response: expected string, got ${typeof raw}`
@@ -70,6 +72,7 @@ export function parseModelResponse(raw: string): ParseResult {
   return {
     thinking,
     toolCall,
+    toolCalls: toolCall ? [toolCall] : [],
     text: toolCall ? null : withoutTerminalTags || null,
     isDone: /<done\s*\/>/i.test(cleaned),
     isError: errorMatch ? errorMatch[1].trim() : null
@@ -79,7 +82,7 @@ export function parseModelResponse(raw: string): ParseResult {
 // ─── Mela Fenced-Block Parser ─────────────────────────────────────────────────
 
 // Matches fenced tool blocks: ```tool_name\ncontent``` (handles any line ending)
-const FENCED_TOOL_RE = /```(\w+)\s*\n([\s\S]*?)```/g;
+const FENCED_TOOL_RE = /```(\w+)[ \t]*\r?\n?([\s\S]*?)```/g;
 
 /**
  * Parse Mela model response which uses backtick-fenced tool blocks
@@ -97,6 +100,7 @@ export function parseMelaResponse(raw: string): ParseResult {
     return {
       thinking: null,
       toolCall: null,
+      toolCalls: [],
       text: null,
       isDone: false,
       isError: `Invalid model response: expected string, got ${typeof raw}`
@@ -120,15 +124,19 @@ export function parseMelaResponse(raw: string): ParseResult {
   // Find fenced tool blocks
   FENCED_TOOL_RE.lastIndex = 0;
   const matches = Array.from(cleaned.matchAll(FENCED_TOOL_RE));
+  const toolCalls: ParsedToolCall[] = [];
 
-    if (matches.length > 0) {
-      const [, name, content] = matches[0];
+  if (matches.length > 0) {
+    for (const match of matches) {
+      const [, name, content] = match;
       const params = parseFencedToolParams(name, content);
-    const toolCall: ParsedToolCall = { name, params };
+      toolCalls.push({ name, params });
+    }
 
     return {
       thinking,
-      toolCall,
+      toolCall: toolCalls[0],
+      toolCalls,
       text: null,
       isDone,
       isError
@@ -144,6 +152,7 @@ export function parseMelaResponse(raw: string): ParseResult {
   return {
     thinking,
     toolCall: null,
+    toolCalls: [],
     text: withoutDone || null,
     isDone,
     isError

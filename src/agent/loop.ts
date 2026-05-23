@@ -430,68 +430,103 @@ export function createAgent(config: AgentConfig): AgentSession {
           return;
         }
 
-        if (parsed.toolCall) {
-          yield { type: 'tool_call', name: parsed.toolCall.name, params: parsed.toolCall.params };
+        if (parsed.toolCalls && parsed.toolCalls.length > 0) {
           context.addTurn({ role: 'assistant', content: raw });
-          if (parsed.toolCall.name === 'done') {
-            const summary = parsed.toolCall.params.summary;
-            if (typeof summary === 'string' && summary.trim()) {
-              yield { type: 'text', content: summary };
-            }
-            yield* handleDone();
-            return;
-          }
-          const result = await executeTool(parsed.toolCall, registry);
-          await logDebug(debug, `TOOL_RESULT ${parsed.toolCall.name} success=${result.success}:\n${result.output}\n${result.error ?? ''}`);
 
-          yield { type: 'step', content: result.success ? `✓ ${parsed.toolCall.name}` : `✗ ${parsed.toolCall.name}` };
+          for (const toolCall of parsed.toolCalls) {
+            yield { type: 'tool_call', name: toolCall.name, params: toolCall.params };
 
-          yield { type: 'tool_result', name: parsed.toolCall.name, success: result.success, output: result.output || result.error || '' };
-          hasProducedOutput = true;
-          afterToolExecution = true;
-
-          // Track in working memory
-          const toolName = parsed.toolCall.name;
-          if (isReadTool(toolName) && result.success) {
-            const path = String(parsed.toolCall.params.path ?? parsed.toolCall.params.file_path ?? '');
-            if (path && !workingMemory.inspectedFiles.includes(path)) {
-              workingMemory.inspectedFiles.push(path);
-            }
-          }
-          if (isEditTool(toolName) && result.success) {
-            const path = String(parsed.toolCall.params.path ?? parsed.toolCall.params.file_path ?? '');
-            if (path && !workingMemory.editedFiles.includes(path)) {
-              workingMemory.editedFiles.push(path);
+            if (toolCall.name === 'done') {
+              const summary = toolCall.params.summary;
+              if (typeof summary === 'string' && summary.trim()) {
+                yield { type: 'text', content: summary };
+              }
+              yield* handleDone();
+              return;
             }
 
-            // Hardened Verification Chain
-            if (!config.skipVerify) {
-              yield { type: 'status', content: 'Running verification chain...' };
-              const verifyRes = await VerificationChain.run(false);
-              if (!verifyRes.passed) {
-                const errorContext = VerificationChain.formatFailuresForAgent(verifyRes.results);
-                context.addTurn({ role: 'user', content: errorContext });
-                yield { type: 'step', content: `✗ verification failed` };
-              } else if (verifyRes.badge) {
-                yield { type: 'step', content: verifyRes.badge };
+            const result = await executeTool(toolCall, registry);
+            await logDebug(debug, `TOOL_RESULT ${toolCall.name} success=${result.success}:\n${result.output}\n${result.error ?? ''}`);
+
+            // Cross-check: verify file-modifying tools actually applied changes to disk
+            if (result.success) {
+              if (toolCall.name === 'write_file') {
+                const filePath = String(toolCall.params.path ?? '');
+                if (filePath) {
+                  try {
+                    await fs.access(path.resolve(process.cwd(), filePath));
+                  } catch {
+                    result.success = false;
+                    result.error = `[VERIFY FAILED] File was not actually created/updated on disk: ${filePath}`;
+                    await logDebug(debug, `CROSS_CHECK write_file: ${filePath} not found after success`);
+                  }
+                }
+              } else if (toolCall.name === 'edit_file' || toolCall.name === 'str_replace') {
+                const filePath = String(toolCall.params.path ?? '');
+                if (filePath) {
+                  try {
+                    await fs.access(path.resolve(process.cwd(), filePath));
+                  } catch {
+                    result.success = false;
+                    result.error = `[VERIFY FAILED] File was not actually found on disk for post-verification: ${filePath}`;
+                    await logDebug(debug, `CROSS_CHECK ${toolCall.name}: ${filePath} not found after success`);
+                  }
+                }
               }
             }
-          }
-          if (!result.success) {
-            const issue = `${toolName}: ${(result.error ?? result.output).slice(0, 80)}`;
-            if (!workingMemory.discoveredIssues.includes(issue)) {
-              workingMemory.discoveredIssues.push(issue);
-            }
-          }
-          if (toolName === 'execute_bash' && result.success) {
-            const output = result.output;
-            const cmd = String(parsed.toolCall.params.cmd ?? parsed.toolCall.params.command ?? '');
-            if (/pass|success|✓/.test(output) && /test|check|verify|lint|typecheck|build/.test(cmd)) {
-              workingMemory.verificationResults.push(`✓ ${cmd.slice(0, 40)}`);
-            }
-          }
 
-          context.addTurn({ role: 'user', content: formatToolResult(parsed.toolCall.name, result) });
+            yield { type: 'step', content: result.success ? `✓ ${toolCall.name}` : `✗ ${toolCall.name}` };
+            yield { type: 'tool_result', name: toolCall.name, success: result.success, output: result.output || result.error || '' };
+
+            hasProducedOutput = true;
+            afterToolExecution = true;
+
+            // Track in working memory
+            const toolName = toolCall.name;
+            if (isReadTool(toolName) && result.success) {
+              const pathStr = String(toolCall.params.path ?? toolCall.params.file_path ?? '');
+              if (pathStr && !workingMemory.inspectedFiles.includes(pathStr)) {
+                workingMemory.inspectedFiles.push(pathStr);
+              }
+            }
+
+            if (isEditTool(toolName) && result.success) {
+              const pathStr = String(toolCall.params.path ?? toolCall.params.file_path ?? '');
+              if (pathStr && !workingMemory.editedFiles.includes(pathStr)) {
+                workingMemory.editedFiles.push(pathStr);
+              }
+
+              // Hardened Verification Chain
+              if (!config.skipVerify) {
+                yield { type: 'status', content: 'Running verification chain...' };
+                const verifyRes = await VerificationChain.run(false);
+                if (!verifyRes.passed) {
+                  const errorContext = VerificationChain.formatFailuresForAgent(verifyRes.results);
+                  context.addTurn({ role: 'user', content: errorContext });
+                  yield { type: 'step', content: `✗ verification failed` };
+                } else if (verifyRes.badge) {
+                  yield { type: 'step', content: verifyRes.badge };
+                }
+              }
+            }
+
+            if (!result.success) {
+              const issue = `${toolName}: ${(result.error ?? result.output).slice(0, 80)}`;
+              if (!workingMemory.discoveredIssues.includes(issue)) {
+                workingMemory.discoveredIssues.push(issue);
+              }
+            }
+
+            if (toolName === 'execute_bash' && result.success) {
+              const output = result.output;
+              const cmd = String(toolCall.params.cmd ?? toolCall.params.command ?? '');
+              if (/pass|success|✓/.test(output) && /test|check|verify|lint|typecheck|build/.test(cmd)) {
+                workingMemory.verificationResults.push(`✓ ${cmd.slice(0, 40)}`);
+              }
+            }
+
+            context.addTurn({ role: 'user', content: formatToolResult(toolCall.name, result) });
+          }
           continue;
         }
 
