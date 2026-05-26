@@ -271,9 +271,22 @@ function parseFencedToolParams(name: string, content: string): Record<string, st
     case 'ask_user':
       return { question: stripParamLabel(trimmed) };
 
+    case 'read_file': {
+      const lines = trimmed.split('\n');
+      const filePath = stripParamLabel(lines[0]).trim();
+      const params: Record<string, string | number | boolean> = { path: filePath };
+      for (let i = 1; i < lines.length; i++) {
+        const kvMatch = lines[i].match(/^\s*(\w+)\s*:\s*(.+)$/);
+        if (kvMatch) {
+          const [, key, val] = kvMatch;
+          params[key] = coerceValue(val.trim());
+        }
+      }
+      return params;
+    }
+
     case 'delete_file':
     case 'make_dir':
-    case 'read_file':
       return { path: stripParamLabel(trimmed) };
 
     case 'copy_file':

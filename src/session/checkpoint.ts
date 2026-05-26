@@ -58,10 +58,17 @@ export class CheckpointManager {
   }
 }
 
-export function registerInterruptHandlers(taskDescription: string, getState: () => { history: ConversationTurn[] }): void {
-  const handleSignal = () => {
+export function registerInterruptHandlers(
+  taskDescription: string,
+  getState: () => { history: ConversationTurn[] },
+  onShutdown?: () => Promise<void>
+): void {
+  const handleSignal = async () => {
     process.stdout.write('\n\x1b[33m⚠️ Interrupted. Saving checkpoint state...\x1b[0m\n');
     try {
+      if (onShutdown) {
+        await onShutdown();
+      }
       const state = getState();
       CheckpointManager.save(taskDescription, state.history);
       process.stdout.write('\x1b[32m✓ Checkpoint saved to .mela-checkpoint.json. You can resume with --resume\x1b[0m\n');

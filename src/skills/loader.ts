@@ -10,6 +10,23 @@ export interface Skill {
 const CUSTOM_SKILL_TRIGGERS: Record<string, RegExp> = {
   // Trigger on coding/task patterns - model decides if planning is needed
   'create-plan': /(?:implement|build|create|add|refactor|update|modify|write|generate|make|feature|component|function|api|auth|theme|css|html|page|cli)\b/i,
+  'security-first': /\b(auth|authentication|authorization|login|signup|password|session|cookie|token|oauth|jwt|api key|secret|credential|permission|csrf|xss|sql injection|input validation|sanitize|external api|webhook|upload|ssl|tls)\b/i,
+  'refactor-master': /\b(refactor|cleanup|clean up|simplify|legacy|technical debt|cyclomatic|complexity|duplicate|duplication|rename|extract method|long function|code smell)\b/i,
+  'debug-ninja': /\b(debug|bug|broken|not working|doesn't work|does not work|failing|fails|failed|error|exception|crash|stack trace|test fail|hang|stuck|loop|wrong output)\b/i,
+  'optimize-performance': /\b(performance|optimi[sz]e|slow|latency|bottleneck|profile|benchmark|memory|cpu|large dataset|real[- ]time|rendering|cache|n\+1|hot path|throughput)\b/i,
+  'api-design': /\b(api|endpoint|route|rest|graphql|schema|sdk|openapi|swagger|webhook|contract|pagination|versioning|status code|error format)\b/i,
+  'database-migration': /\b(database|db|migration|schema|model|table|column|index|constraint|relation|orm|backfill|rollback|seed|prisma|sequelize|typeorm|knex|sql)\b/i,
+};
+
+const SKILL_PRIORITY: Record<string, number> = {
+  'security-first': 100,
+  'database-migration': 90,
+  'api-design': 80,
+  'debug-ninja': 70,
+  'optimize-performance': 60,
+  'refactor-master': 50,
+  'frontend-design': 40,
+  'create-plan': 10,
 };
 
 export class SkillLoader {
@@ -60,6 +77,8 @@ export class SkillLoader {
    * Match a task description against discovered skills and return the list of matched skills.
    */
   static matchSkills(task: string, skills: Skill[]): Skill[] {
-    return skills.filter(skill => skill.triggers.test(task));
+    return skills
+      .filter(skill => skill.triggers.test(task))
+      .sort((a, b) => (SKILL_PRIORITY[b.name] ?? 0) - (SKILL_PRIORITY[a.name] ?? 0));
   }
 }

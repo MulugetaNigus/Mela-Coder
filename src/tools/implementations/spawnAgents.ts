@@ -24,11 +24,14 @@ export const spawnAgentsTool: ToolDefinition = {
       }));
 
       const melaToken = process.env.MELA_TOKEN;
+      const melaRefreshToken = process.env.MELA_REFRESH_TOKEN;
       if (!melaToken) {
         return { success: false, output: '', error: 'MELA_TOKEN not set' };
       }
 
-      const client = new MelaClient(melaToken);
+      const client = new MelaClient(melaToken, {
+        refreshTokenCookie: melaRefreshToken,
+      });
 
       const dispatcher = new AgentDispatcher(3);
       const results = await dispatcher.dispatch(agents, melaToken, client);
@@ -131,11 +134,14 @@ export const dispatchSubtasksTool: ToolDefinition = {
       if (rawTasks.length === 0) throw new Error('tasks must have at least 1 item');
 
       const melaToken = process.env.MELA_TOKEN;
+      const melaRefreshToken = process.env.MELA_REFRESH_TOKEN;
       if (!melaToken) {
         return { success: false, output: '', error: 'MELA_TOKEN not set' };
       }
 
-      const client = new MelaClient(melaToken);
+      const client = new MelaClient(melaToken, {
+        refreshTokenCookie: melaRefreshToken,
+      });
 
       const agents: SubAgentParams[] = rawTasks.map(t => {
         const desc = (t.description ?? '') as string;

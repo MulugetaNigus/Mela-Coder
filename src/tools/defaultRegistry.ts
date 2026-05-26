@@ -15,8 +15,16 @@ import { spawnAgentsTool, getAgentTypesTool, dispatchSubtasksTool } from './impl
 import { strReplaceTool } from './implementations/strReplace';
 import { suggestFollowupsTool } from './implementations/suggestFollowups';
 import { doneTool, showDiffTool } from './implementations/uxTools';
-import { fetchUrlTool, readGithubFileTool, readGithubIssueTool, webSearchTool } from './implementations/webTools';
+import { fetchUrlTool, apifyScrapeTool, readGithubFileTool, readGithubIssueTool, webSearchTool } from './implementations/webTools';
 import { writeFileTool } from './implementations/writeFile';
+import { revertChangesTool } from './implementations/revertChanges';
+import { dockerizeTool } from './implementations/dockerize';
+import { securityScanTool } from './implementations/securityScan';
+import { analyzeDependenciesTool } from './implementations/analyzeDependencies';
+import { detectCodeSmellsTool } from './implementations/detectCodeSmells';
+import { generateTestsTool } from './implementations/generateTests';
+import { explainCodeTool } from './implementations/explainCode';
+import { migrateCodeTool } from './implementations/migrateCode';
 import { writeTodosTool } from './implementations/writeTodos';
 import { createGetToolDefinitionsTool } from './implementations/toolDefinitions';
 import { ToolRegistry } from './registry';
@@ -48,6 +56,7 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(taskNotesTool);
   registry.register(summarizeContextTool);
   registry.register(webSearchTool);
+  registry.register(apifyScrapeTool);
   registry.register(fetchUrlTool);
   registry.register(readGithubIssueTool);
   registry.register(readGithubFileTool);
@@ -73,6 +82,14 @@ export function createDefaultRegistry(): ToolRegistry {
   registry.register(spawnAgentsTool);
   registry.register(getAgentTypesTool);
   registry.register(dispatchSubtasksTool);
+  registry.register(revertChangesTool);
+  registry.register(dockerizeTool);
+  registry.register(securityScanTool);
+  registry.register(analyzeDependenciesTool);
+  registry.register(detectCodeSmellsTool);
+  registry.register(generateTestsTool);
+  registry.register(explainCodeTool);
+  registry.register(migrateCodeTool);
   registry.register(createGetToolDefinitionsTool(registry));
   return registry;
 }

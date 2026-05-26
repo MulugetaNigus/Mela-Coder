@@ -100,6 +100,7 @@ import { ConversationTurn, WorkingMemory } from './contextManager';
 
 export interface AgentConfig {
   melaToken: string;
+  melaRefreshToken?: string;
   maxIterations?: number;
   debug?: boolean;
   reasoning?: boolean;
@@ -117,6 +118,7 @@ export interface AgentSession {
   getHistoryStats(): { turns: number; estimatedTokens: number };
   setDebug(debug: boolean): void;
   getState(): { history: ConversationTurn[] };
+  shutdown(): Promise<void>;
 }
 
 export type AgentEvent =
@@ -158,6 +160,30 @@ function shouldForceWorkspaceExploration(task: string): boolean {
 
 function isListWorkspaceRequest(task: string): boolean {
   return /\b(list|show)\b/i.test(task) && /\b(files?|folders?|directories|tree|workspace|project)\b/i.test(task);
+}
+
+function isCapabilityRequest(task: string): boolean {
+  return /\b(what can you do|capabilit(?:y|ies)|list your (?:all )?capabilit(?:y|ies)|available tools|what tools|your tools)\b/i.test(task);
+}
+
+async function validateFileToolCall(name: string, params: Record<string, unknown>): Promise<string | null> {
+  if (!['write_file', 'edit_file', 'str_replace', 'delete_file', 'rename_file'].includes(name)) return null;
+  const rawPath = params.path ?? params.file_path ?? params.target_file;
+  if (typeof rawPath !== 'string' || rawPath.trim() === '') {
+    return `${name} needs a specific file path string. I will not retry with missing file parameters.`;
+  }
+  if (name === 'write_file') return null;
+  try {
+    const stat = await fs.stat(path.resolve(process.cwd(), rawPath));
+    if (stat.isDirectory()) {
+      return `${name} was given a directory (${rawPath}), but it requires a specific file path. I will not retry that invalid call.`;
+    }
+  } catch {
+    if (name === 'edit_file' || name === 'str_replace' || name === 'delete_file') {
+      return `${name} target does not exist (${rawPath}). I will not retry that invalid call.`;
+    }
+  }
+  return null;
 }
 
 function getWorkspaceNudge(task: string): string | null {
@@ -327,7 +353,10 @@ export function createAgent(config: AgentConfig): AgentSession {
   const systemPrompt = buildSystemPrompt(registry, projectMemory);
   const memory = new MemoryManager();
   const context = new ContextManager(systemPrompt, memory);
-  const client = new MelaClient(config.melaToken);
+  const client = new MelaClient(config.melaToken, {
+    refreshTokenCookie: config.melaRefreshToken,
+  });
+  client.startAutoRefresh();
   let stopped = false;
   let debug = config.debug ?? false;
 
@@ -392,6 +421,7 @@ export function createAgent(config: AgentConfig): AgentSession {
     // P2.1: Tool-level loop detection (tracks recent tool call signatures)
     const recentToolSignatures: string[] = [];
     const MAX_IDENTICAL_TOOL_CALLS = 3;
+    let directAnswerRetry = false;
 
     // Working memory is managed by context manager
     let workingMemory = context.getWorkingMemory();
@@ -617,9 +647,28 @@ export function createAgent(config: AgentConfig): AgentSession {
           context.addTurn({ role: 'assistant', content: raw });
           yield* handleDone();
           return;
-}
+        }
 
         if (parsed.toolCalls && parsed.toolCalls.length > 0) {
+          if (isCapabilityRequest(task)) {
+            context.addTurn({ role: 'assistant', content: raw });
+            if (parsed.text && parsed.text.trim()) {
+              yield { type: 'text', content: parsed.text };
+              yield* handleDone();
+              return;
+            }
+            if (!directAnswerRetry) {
+              directAnswerRetry = true;
+              context.addTurn({
+                role: 'user',
+                content: 'Answer the capability/help question in plain text only. Do not call tools for this request.'
+              });
+              continue;
+            }
+            yield* handleDone();
+            return;
+          }
+
           context.addTurn({ role: 'assistant', content: raw });
 
           // Transition to executing state now that we have tool calls (only once per turn)
@@ -628,6 +677,13 @@ export function createAgent(config: AgentConfig): AgentSession {
           }
 
           for (const toolCall of parsed.toolCalls) {
+            const invalidFileTool = await validateFileToolCall(toolCall.name, toolCall.params);
+            if (invalidFileTool) {
+              yield { type: 'text', content: invalidFileTool };
+              yield* handleDone();
+              return;
+            }
+
             yield { type: 'tool_call', name: toolCall.name, params: toolCall.params };
 
             // P2.1: Track tool call signatures for loop detection
@@ -682,11 +738,12 @@ export function createAgent(config: AgentConfig): AgentSession {
 
             // P2.2: Special recovery for permission denials — don't let model retry
             if (!result.success && result.error?.includes('[BLOCKED]')) {
-              context.addTurn({
-                role: 'user',
-                content: `[PERMISSION DENIED] The user explicitly denied permission for "${toolCall.name}". Do NOT retry this action. Inform the user that the action was blocked and suggest an alternative, then end with [done].`
-              });
-              break; // Skip remaining tool calls in this batch
+              yield {
+                type: 'text',
+                content: `Permission denied for ${toolCall.name}. I will not retry that action.`
+              };
+              yield* handleDone();
+              return;
             }
 
             // P2.1: Recovery for unknown tool calls — correct the model
@@ -800,6 +857,18 @@ export function createAgent(config: AgentConfig): AgentSession {
     setDebug(value: boolean): void { debug = value; },
     getState(): { history: ConversationTurn[] } {
       return { history: context.getHistoryForRequest() };
+    },
+    async shutdown(): Promise<void> {
+      client.stopAutoRefresh();
+      const newToken = await client.refreshAccessToken();
+      if (newToken) {
+        const { saveToken, saveRefreshToken } = await import('../auth/tokenManager');
+        saveToken(newToken);
+        const newRefreshToken = client.getRefreshTokenCookie();
+        if (newRefreshToken) {
+          saveRefreshToken(newRefreshToken);
+        }
+      }
     }
   };
 }

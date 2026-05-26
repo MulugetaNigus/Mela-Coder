@@ -2,6 +2,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import open from 'open';
 import readline from 'node:readline';
 import process from 'node:process';
+import { saveToken, saveRefreshToken } from './tokenManager';
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes for manual token copy
 
@@ -20,11 +21,11 @@ export async function browserLogin(): Promise<string> {
   
   process.stdout.write(`After logging in:
   1. Open browser dev tools (F12)
-  2. Go to Application → Local Storage  
-  3. Copy the value of "access_token"
+  2. Go to Application → Cookies → mela.aii.et
+  3. Copy the value of "refresh_token"
   4. Paste it below (Ctrl+Shift+V to paste)
 
-Enter token: `);
+Enter refresh_token: `);
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -32,20 +33,35 @@ Enter token: `);
   });
 
   return new Promise<string>((resolve, reject) => {
+    let refreshToken = '';
+
+    const askAccessToken = () => {
+      process.stdout.write(`\nNow paste the "access_token" from Application → Local Storage: `);
+    };
+
     const timeout = setTimeout(() => {
       rl.close();
-      reject(new Error('Login timeout - please provide the token'));
+      reject(new Error('Login timeout'));
     }, LOGIN_TIMEOUT_MS);
 
     rl.on('line', (line) => {
-      clearTimeout(timeout);
       const trimmed = line.trim();
-      if (trimmed && trimmed.startsWith('eyJ')) {
-        rl.close();
-        resolve(trimmed);
-      } else {
-        process.stdout.write(`\nInvalid token format. Token should start with 'eyJ'. Try again or Ctrl+C to cancel: `);
+      if (!trimmed.startsWith('eyJ')) {
+        process.stdout.write(`\nInvalid format. Token should start with 'eyJ'. Try again: `);
+        return;
       }
+      
+      if (!refreshToken) {
+        refreshToken = trimmed;
+        saveRefreshToken(trimmed);
+        askAccessToken();
+        return;
+      }
+
+      clearTimeout(timeout);
+      saveToken(trimmed);
+      rl.close();
+      resolve(trimmed);
     });
 
     rl.on('close', () => {

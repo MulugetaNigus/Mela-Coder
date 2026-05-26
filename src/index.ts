@@ -9,7 +9,7 @@ import { startRepl } from './cli/repl';
 import { setAutoApply } from './ui/diff';
 import { CheckpointManager, registerInterruptHandlers } from './session/checkpoint';
 import { browserLogin } from './auth/browserLogin';
-import { loadToken, saveToken, ensureEnvGitignored } from './auth/tokenManager';
+import { loadToken, loadRefreshToken, saveToken, ensureEnvGitignored } from './auth/tokenManager';
 import { showAuthSuccess, showAuthError } from './cli/authPrompt';
 
 interface CliArgs {
@@ -165,12 +165,15 @@ async function main(): Promise<void> {
 
   if (args.refreshToken) {
     const existingToken = loadToken();
+    const existingRefreshToken = loadRefreshToken();
     if (!existingToken) {
       process.stderr.write('No existing token found. Use --login to authenticate.\n');
       process.exitCode = 1;
       return;
     }
-    const client = new MelaClient(existingToken);
+    const client = new MelaClient(existingToken, {
+      refreshTokenCookie: existingRefreshToken ?? undefined,
+    });
     const newToken = await client.refreshAccessToken();
     if (newToken) {
       saveToken(newToken);
@@ -205,23 +208,42 @@ async function main(): Promise<void> {
   const validation = await tokenCheck.validateToken();
   if (!validation.ok) {
     process.stderr.write(`error · ${validation.error}\n`);
-    process.stdout.write('\n\x1b[33mYour token may be invalid or expired.\x1b[0m\n');
-    process.stdout.write('Starting browser login for a new token...\n\n');
-    
+
+    const existingRefreshToken = loadRefreshToken();
+    if (existingRefreshToken) {
+      process.stdout.write('Trying token refresh...\n');
+      const refreshClient = new MelaClient(melaToken, {
+        refreshTokenCookie: existingRefreshToken,
+      });
+      const newToken = await refreshClient.refreshAccessToken();
+      if (newToken) {
+        saveToken(newToken);
+        melaToken = newToken;
+        process.stdout.write('\x1b[32m✓ Token refreshed.\x1b[0m\n\n');
+      } else {
+        process.stdout.write('\x1b[33mToken refresh failed. Starting browser login...\x1b[0m\n\n');
+        const ok = await promptBrowserLogin();
+        if (!ok) { process.exitCode = 1; return; }
+      }
+    } else {
+      process.stdout.write('\n\x1b[33mYour token may be invalid or expired.\x1b[0m\n');
+      process.stdout.write('Starting browser login for a new token...\n\n');
+      const ok = await promptBrowserLogin();
+      if (!ok) { process.exitCode = 1; return; }
+    }
+  }
+
+  async function promptBrowserLogin(): Promise<boolean> {
     try {
       const newToken = await browserLogin();
-      if (!newToken) {
-        showAuthError('No token received');
-        process.exitCode = 1;
-        return;
-      }
+      if (!newToken) { showAuthError('No token received'); return false; }
       melaToken = newToken;
       saveToken(melaToken);
       showAuthSuccess();
+      return true;
     } catch (err: any) {
       showAuthError(err.message);
-      process.exitCode = 1;
-      return;
+      return false;
     }
   }
 
@@ -257,8 +279,11 @@ async function main(): Promise<void> {
     }
   }
 
+  const melaRefreshToken = loadRefreshToken() ?? undefined;
+
   const agent = createAgent({
     melaToken,
+    melaRefreshToken,
     maxIterations: args.maxIter,
     debug: args.debug,
     reasoning: args.reasoning,
@@ -276,7 +301,7 @@ async function main(): Promise<void> {
   }
 
   if (task) {
-    registerInterruptHandlers(task, () => agent.getState());
+    registerInterruptHandlers(task, () => agent.getState(), async () => agent.shutdown());
     let exitCode = 1;
     for await (const event of agent.run(task)) {
       await renderer.render(event);
@@ -285,6 +310,9 @@ async function main(): Promise<void> {
         CheckpointManager.delete();
       }
       if (event.type === 'error') exitCode = 1;
+    }
+    if (exitCode === 0) {
+      await agent.shutdown();
     }
     process.exitCode = exitCode;
     return;

@@ -1,6 +1,105 @@
 import type { ToolDefinition, ToolResult } from '../registry';
 import { cap } from './toolUtils';
 
+function getApiKey(): string {
+  const key = process.env.APIFY_KEY || process.env.APIFY_TOKEN;
+  if (!key) throw new Error('APIFY_KEY not set in .env. Add APIFY_KEY=your_apify_api_token');
+  return key;
+}
+
+async function runApifyActor(actorId: string, input: unknown, apiKey: string): Promise<any[]> {
+  const runRes = await fetch(
+    `https://api.apify.com/v2/acts/${actorId}/runs?token=${apiKey}&waitForFinish=60`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    }
+  );
+  if (!runRes.ok) {
+    const errText = await runRes.text();
+    throw new Error(`Apify API error (${runRes.status}): ${errText.slice(0, 200)}`);
+  }
+  const runData = await runRes.json() as any;
+  const datasetId = runData?.data?.defaultDatasetId;
+  if (!datasetId) throw new Error('Apify run did not return a dataset ID');
+  const itemsRes = await fetch(
+    `https://api.apify.com/v2/datasets/${datasetId}/items?token=${apiKey}&format=json`,
+  );
+  if (!itemsRes.ok) throw new Error(`Apify dataset error: ${itemsRes.status}`);
+  return itemsRes.json() as Promise<any[]>;
+}
+
+export const webSearchTool: ToolDefinition = {
+  name: 'web_search',
+  description: 'Search the web using Apify Google Search. Returns title, URL, and snippet for each result. Set APIFY_KEY in .env.',
+  params: [
+    { name: 'query', type: 'string', required: true, description: 'Search query.' },
+    { name: 'limit', type: 'number', required: false, description: 'Number of results. Defaults to 5. Max 20.' },
+  ],
+  async execute(params): Promise<ToolResult> {
+    try {
+      if (typeof params.query !== 'string') throw new Error('query must be a string');
+      const limit = Math.min(typeof params.limit === 'number' ? params.limit : 5, 20);
+      const apiKey = getApiKey();
+      const items = await runApifyActor('apify~google-search-scraper', {
+        queries: params.query,
+        resultsPerPage: limit,
+        maxPagesPerQuery: 1,
+        mobileResults: false,
+      }, apiKey);
+       if (!Array.isArray(items) || items.length === 0) {
+        return { success: true, output: `No results found for "${params.query}".` };
+      }
+      const organicResults = items[0]?.organicResults ?? items;
+      if (!Array.isArray(organicResults) || organicResults.length === 0) {
+        return { success: true, output: `No results found for "${params.query}".` };
+      }
+      const results = organicResults.slice(0, limit).map((item: any, idx: number) => {
+        const title = item.title || 'No title';
+        const url = item.url || '';
+        const snippet = item.snippet || item.description || '';
+        return `${idx + 1}. ${cap(title, 120)}\n${url}\n${cap(snippet, 300)}`;
+      }).join('\n\n');
+      return { success: true, output: results };
+    } catch (err: any) {
+      return { success: false, output: '', error: err?.message ?? 'Web search failed' };
+    }
+  }
+};
+
+export const apifyScrapeTool: ToolDefinition = {
+  name: 'apify_scrape',
+  description: 'Extract clean text content from a URL using Apify Website Content Crawler. Set APIFY_KEY in .env.',
+  params: [
+    { name: 'url', type: 'string', required: true, description: 'URL to scrape.' },
+    { name: 'maxChars', type: 'number', required: false, description: 'Max characters to return. Defaults to 12000.' },
+  ],
+  async execute(params): Promise<ToolResult> {
+    try {
+      if (typeof params.url !== 'string') throw new Error('url must be a string');
+      const maxChars = typeof params.maxChars === 'number' ? params.maxChars : 12000;
+      const apiKey = getApiKey();
+      const items = await runApifyActor('apify~website-content-crawler', {
+        startUrls: [{ url: params.url }],
+        maxCrawlingDepth: 0,
+        maxPagesPerCrawl: 1,
+        extractMainContent: true,
+      }, apiKey);
+      if (!Array.isArray(items) || items.length === 0) {
+        return { success: false, output: '', error: `No content extracted from ${params.url}` };
+      }
+      const page = items[0];
+      const title = page.title || page.metadata?.title || '';
+      const text = page.text || page.content || '';
+      const output = title ? `# ${title}\n\n${cap(text, maxChars)}` : cap(text, maxChars);
+      return { success: true, output };
+    } catch (err: any) {
+      return { success: false, output: '', error: err?.message ?? 'Failed to scrape URL' };
+    }
+  }
+};
+
 function stripHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -13,29 +112,6 @@ function stripHtml(html: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 }
-
-export const webSearchTool: ToolDefinition = {
-  name: 'web_search',
-  description: 'Search the web and return top result snippets.',
-  params: [
-    { name: 'query', type: 'string', required: true, description: 'Search query.' },
-    { name: 'limit', type: 'number', required: false, description: 'Number of results. Defaults to 5.' }
-  ],
-  async execute(params): Promise<ToolResult> {
-    try {
-      if (typeof params.query !== 'string') throw new Error('query must be a string');
-      const limit = typeof params.limit === 'number' ? params.limit : 5;
-      const response = await fetch(`https://duckduckgo.com/html/?q=${encodeURIComponent(params.query)}`);
-      const html = await response.text();
-      const results = Array.from(html.matchAll(/<a rel="nofollow" class="result__a" href="([^"]+)">([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet"[\s\S]*?>([\s\S]*?)<\/a>/g))
-        .slice(0, limit)
-        .map((match, index) => `${index + 1}. ${stripHtml(match[2])}\n${match[1]}\n${stripHtml(match[3])}`);
-      return { success: response.ok, output: results.length ? results.join('\n\n') : `No web results found for ${params.query}`, error: response.ok ? undefined : `HTTP ${response.status}` };
-    } catch (err: any) {
-      return { success: false, output: '', error: err?.message ?? 'Web search failed' };
-    }
-  }
-};
 
 export const fetchUrlTool: ToolDefinition = {
   name: 'fetch_url',

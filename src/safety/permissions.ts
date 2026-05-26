@@ -59,7 +59,7 @@ export function classifyToolCall(toolName: string, params: Record<string, unknow
   }
 
   if (
-    ['write_file', 'edit_file', 'str_replace', 'copy_file', 'rename_file', 'make_dir'].includes(toolName)
+    ['write_file', 'edit_file', 'str_replace', 'copy_file', 'rename_file', 'make_dir', 'revert_changes', 'dockerize'].includes(toolName)
   ) {
     return PermissionTier.WRITE_LOCAL;
   }

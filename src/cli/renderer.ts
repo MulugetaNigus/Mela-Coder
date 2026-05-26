@@ -192,18 +192,6 @@ function renderMarkdown(text: string, chalk: ChalkLike, insideCodeBlockRef?: { v
   return result;
 }
 
-const LOADING_FRAMES = [
-  '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏',
-];
-
-const LOADING_LABELS = [
-  'thinking',
-  'analyzing',
-  'processing',
-  'working',
-  'thinking'
-];
-
 const KNOWN_TOOLS = new Set([
   'read_file', 'write_file', 'edit_file', 'str_replace', 'delete_file',
   'execute_bash', 'run_cmd', 'list_dir', 'list_files', 'glob',
@@ -233,7 +221,11 @@ export class Renderer {
   private toolColor: any = null;
   private insideMarkdownCodeBlock = false;
   private thinkingLineLength = 0;
+  private thinkingLinesPrinted = 0;
+  private suppressThinkingOutput = false;
   private insideThoughtBlock = false;
+  private pendingFile: string | null = null;
+  private spinnerCustomLabel: string | null = null;
 
   constructor(private debug = false) {
     Renderer.activeInstance = this;
@@ -278,17 +270,51 @@ export class Renderer {
     return result;
   }
 
-  public startSpinner(): void {
+  private outputMarkdownWrapped(
+    rawText: string,
+    firstPrefix: string,
+    followPrefix: string,
+    isFirstBlock: boolean,
+    chalk: ChalkLike,
+    codeBlockRef: { value: boolean }
+  ): boolean {
+    const termWidth = process.stdout.columns || 80;
+    const prefixLen = visibleLength(followPrefix);
+    const availWidth = Math.max(termWidth - prefixLen, 20);
+    let anyOutput = false;
+
+    for (const rawLine of rawText.split('\n')) {
+      const wrapped = this.wrapLine(rawLine, availWidth);
+      for (let wi = 0; wi < wrapped.length; wi++) {
+        const rendered = renderMarkdown(wrapped[wi], chalk, codeBlockRef);
+        const prefix = (wi === 0 && !anyOutput && isFirstBlock) ? firstPrefix : followPrefix;
+        process.stdout.write(`${prefix}${rendered}\n`);
+        anyOutput = true;
+      }
+    }
+    return anyOutput;
+  }
+
+  public startSpinner(customLabel?: string): void {
     if (this.spinnerTimer) return;
     this.spinnerFrame = 0;
-    this.spinnerLabelFrame = 0;
-    this.spinnerTimer = setInterval(() => {
-      const frame = LOADING_FRAMES[this.spinnerFrame % LOADING_FRAMES.length];
-      const label = LOADING_LABELS[this.spinnerLabelFrame % LOADING_LABELS.length];
+    process.stdout.write('\n');
+    const renderFrame = () => {
+      const label = 'Working...';
+      const waveHead = label.length - 1 - (this.spinnerFrame % (label.length + 3));
+      const rendered = [...label].map((char, index) => {
+        if (index === waveHead) return `\x1b[1;97m${char}\x1b[0m`;
+        if (index === waveHead + 1) return `\x1b[1;37m${char}\x1b[0m`;
+        if (index === waveHead + 2) return `\x1b[1;90m${char}\x1b[0m`;
+        return `\x1b[1;2m${char}\x1b[0m`;
+      }).join('');
       this.spinnerFrame++;
-      if (this.spinnerFrame % 30 === 0) this.spinnerLabelFrame++;
-      process.stdout.write(`\r\x1b[K  ${frame} ${label}`);
-    }, 60);
+      process.stdout.write(`\r\x1b[K${rendered}`);
+    };
+    renderFrame();
+    this.spinnerTimer = setInterval(() => {
+      renderFrame();
+    }, 420);
   }
 
   public stopSpinner(): void {
@@ -334,10 +360,16 @@ export class Renderer {
         this.stopSpinner();
         this.modelResponded = true;
         this.thinkingLineLength = 0;
-        process.stdout.write(`\n  ${chalk.blue('Thinking...')}\n  ${chalk.dim('│')} `);
+        if (this.thinkingLinesPrinted >= 5) {
+          this.suppressThinkingOutput = true;
+          break;
+        }
+        this.suppressThinkingOutput = false;
+        process.stdout.write(`\n  ${chalk.dim('Thinking...')}\n  ${chalk.dim('│')} `);
         break;
       }
       case 'thinking_chunk': {
+        if (this.suppressThinkingOutput) break;
         const text = event.content;
         const termWidth = process.stdout.columns || 80;
         const maxLen = Math.max(termWidth - 8, 40);
@@ -352,6 +384,10 @@ export class Renderer {
               process.stdout.write(`\n  ${chalk.dim('│')} `);
               this.thinkingLineLength = 0;
             }
+            if (this.thinkingLineLength === 0) {
+              this.thinkingLinesPrinted++;
+              if (this.thinkingLinesPrinted > 5) break;
+            }
             process.stdout.write(chalk.gray(char));
             this.thinkingLineLength++;
           }
@@ -359,6 +395,10 @@ export class Renderer {
         break;
       }
       case 'thinking_end': {
+        if (this.suppressThinkingOutput) {
+          this.suppressThinkingOutput = false;
+          break;
+        }
         process.stdout.write('\n\n');
         break;
       }
@@ -367,6 +407,7 @@ export class Renderer {
         this.modelResponded = true;
         const content = event.content.trim();
         if (!content) break;
+        if (this.thinkingLinesPrinted >= 5) break;
 
         const termWidth = process.stdout.columns || 80;
         const contentWidth = termWidth - 8; // 2 indent + 3 gutter + 3 padding
@@ -382,8 +423,11 @@ export class Renderer {
           // Word-wrap each line
           const wrapped = this.wrapLine(line, contentWidth);
           for (let i = 0; i < wrapped.length; i++) {
+            if (this.thinkingLinesPrinted >= 5) break;
             process.stdout.write(`  ${gutter} ${chalk.gray(wrapped[i])}\n`);
+            this.thinkingLinesPrinted++;
           }
+          if (this.thinkingLinesPrinted >= 5) break;
         }
         break;
       }
@@ -391,7 +435,10 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         this.modelResponded = true;
-        process.stdout.write(`  ${chalk.dim('·')} ${chalk.dim(event.content)}\n`);
+        const termWidth = process.stdout.columns || 80;
+        const availWidth = Math.max(termWidth - 4, 20);
+        const wrapped = this.wrapLine(event.content, availWidth);
+        for (const w of wrapped) process.stdout.write(`  ${chalk.dim('·')} ${chalk.dim(w)}\n`);
         break;
       }
       case 'status':
@@ -434,8 +481,14 @@ export class Renderer {
             continue;
           }
 
-          // Suppress raw file header lines (e.g. standalone "2026-05-25.html")
+          // Show pending file generation with spinner
           if (FILENAME_RE.test(trimmedLine)) {
+            this.stopSpinner();
+            this.pendingFile = trimmedLine;
+            this.hasVisibleOutput = true;
+            this.modelResponded = true;
+            process.stdout.write(`  ${chalk.yellow('📝')} ${chalk.dim(trimmedLine)}\n`);
+            this.startSpinner(chalk.dim(`generating ${trimmedLine}`));
             continue;
           }
 
@@ -446,23 +499,6 @@ export class Renderer {
           // Detect 'Thought · ' or 'Thought:' lines and render with Thinking header + gutter format
           const thoughtMatch = trimmedLine.match(/^\+?\s*(?:Thought|Thinking)\s*[·:]\s*(.*)$/i);
           if (thoughtMatch) {
-            this.insideThoughtBlock = true;
-            if (!this.streamStarted) {
-              process.stdout.write(`\n`);
-              this.streamStarted = true;
-            }
-            process.stdout.write(`  ${chalk.blue('Thinking...')}\n`);
-            
-            const content = thoughtMatch[1].trim();
-            if (content) {
-              const termWidth = process.stdout.columns || 80;
-              const contentWidth = termWidth - 8;
-              const gutter = chalk.dim('│');
-              const wrapped = this.wrapLine(content, contentWidth);
-              for (const w of wrapped) {
-                process.stdout.write(`  ${gutter} ${chalk.gray(w)}\n`);
-              }
-            }
             continue;
           }
 
@@ -485,14 +521,10 @@ export class Renderer {
 
           if (trimmedLine && !shouldSuppressThinkingLine(line)) {
             const ref = { value: this.insideMarkdownCodeBlock };
-            const rendered = renderMarkdown(line, chalk, ref);
+            const wasStarted = this.streamStarted;
+            const newOutput = this.outputMarkdownWrapped(line, '  💬 ', '     ', !wasStarted, chalk, ref);
             this.insideMarkdownCodeBlock = ref.value;
-            if (!this.streamStarted) {
-              process.stdout.write(`\n  💬 ${rendered}\n`);
-              this.streamStarted = true;
-            } else {
-              process.stdout.write(`     ${rendered}\n`);
-            }
+            if (newOutput) this.streamStarted = true;
           } else if (!trimmedLine) {
             if (this.streamStarted) {
               process.stdout.write(`\n`);
@@ -521,6 +553,14 @@ export class Renderer {
             continue;
           }
           if (FILENAME_RE.test(trimmed)) {
+            if (!this.pendingFile) {
+              this.stopSpinner();
+              this.pendingFile = trimmed;
+              this.hasVisibleOutput = true;
+              this.modelResponded = true;
+              process.stdout.write(`  ${chalk.yellow('📝')} ${chalk.dim(trimmed)}\n`);
+              this.startSpinner(chalk.dim(`generating ${trimmed}`));
+            }
             continue;
           }
           filteredLines.push(line);
@@ -536,14 +576,10 @@ export class Renderer {
             const trimmed = line.trim();
             if (trimmed) {
               const ref = { value: this.insideMarkdownCodeBlock };
-              const rendered = renderMarkdown(line, chalk, ref);
+              const wasStarted = this.streamStarted;
+              const newOutput = this.outputMarkdownWrapped(line, '  💬 ', '     ', !wasStarted, chalk, ref);
               this.insideMarkdownCodeBlock = ref.value;
-              if (!this.streamStarted) {
-                process.stdout.write(`\n  💬 ${rendered}\n`);
-                this.streamStarted = true;
-              } else {
-                process.stdout.write(`     ${rendered}\n`);
-              }
+              if (newOutput) this.streamStarted = true;
             } else {
               if (this.streamStarted) {
                 process.stdout.write(`\n`);
@@ -586,6 +622,14 @@ export class Renderer {
               continue;
             }
             if (FILENAME_RE.test(trimmed)) {
+              if (!this.pendingFile) {
+                this.stopSpinner();
+                this.pendingFile = trimmed;
+                this.hasVisibleOutput = true;
+                this.modelResponded = true;
+                process.stdout.write(`  ${chalk.yellow('📝')} ${chalk.dim(trimmed)}\n`);
+                this.startSpinner(chalk.dim(`generating ${trimmed}`));
+              }
               continue;
             }
             filteredLines.push(line);
@@ -598,26 +642,19 @@ export class Renderer {
             .trim();
           if (cleaned) {
             const cleanedLines = cleaned.split('\n');
-            let textOutput = '';
-            let tempStarted = false;
+            let firstOutput = true;
             const ref = { value: false };
             for (const line of cleanedLines) {
               const trimmed = line.trim();
               if (trimmed) {
-                const rendered = renderMarkdown(line, chalk, ref);
-                if (!tempStarted) {
-                  textOutput += `\n  💬 ${rendered}\n`;
-                  tempStarted = true;
-                } else {
-                  textOutput += `     ${rendered}\n`;
-                }
+                const wasStarted = !firstOutput;
+                const newOutput = this.outputMarkdownWrapped(line, '  💬 ', '     ', !wasStarted, chalk, ref);
+                if (newOutput) firstOutput = false;
               } else {
-                if (tempStarted) {
-                  textOutput += `\n`;
-                }
+                if (!firstOutput) process.stdout.write('\n');
               }
             }
-            process.stdout.write(textOutput + '\n');
+            if (!firstOutput) process.stdout.write('\n');
           }
         }
         break;
@@ -626,6 +663,7 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         this.modelResponded = true;
+        this.pendingFile = null;
 
         const pathStr = (event.params.path ?? event.params.file_path ?? event.params.target_file ?? '') as string;
         const cmdStr = (event.params.cmd ?? event.params.command ?? '') as string;
@@ -717,6 +755,8 @@ export class Renderer {
               }
             } else if (event.name === 'web_search') {
               const results = output.split('\n\n');
+              const termWidth = process.stdout.columns || 80;
+              const availWidth = Math.max(termWidth - 8, 20);
               for (const r of results) {
                 const lines = r.split('\n').filter(l => l.trim());
                 if (lines.length === 0) continue;
@@ -726,7 +766,10 @@ export class Renderer {
                 
                 process.stdout.write(`    ${chalk.bold(title)}\n`);
                 if (url) process.stdout.write(`      ${chalk.dim(url)}\n`);
-                if (snippet) process.stdout.write(`      ${chalk.gray(snippet)}\n`);
+                if (snippet) {
+                  const wrapped = this.wrapLine(snippet, availWidth);
+                  for (const w of wrapped) process.stdout.write(`      ${chalk.gray(w)}\n`);
+                }
               }
             } else {
               const outLines = output.split('\n');
@@ -736,7 +779,12 @@ export class Renderer {
                 displayLines = outLines.slice(0, 10);
                 truncated = true;
               }
-              const formattedOut = displayLines.map(line => `    ${chalk.gray(line)}`).join('\n');
+              const termWidth = process.stdout.columns || 80;
+              const availWidth = Math.max(termWidth - 4, 20);
+              const formattedOut = displayLines.map(line => {
+                const wrapped = this.wrapLine(line, availWidth);
+                return wrapped.map(w => `    ${chalk.gray(w)}`).join('\n');
+              }).join('\n');
               process.stdout.write(`${formattedOut}\n`);
               if (truncated) {
                 process.stdout.write(`    ${chalk.yellow(`... (${outLines.length - 10} more lines truncated)`)}\n`);
@@ -792,6 +840,10 @@ export class Renderer {
         break;
       }
       case 'iteration': {
+        if (event.count === 1) {
+          this.thinkingLinesPrinted = 0;
+          this.suppressThinkingOutput = false;
+        }
         this.iterationStart = Date.now();
         this.modelResponded = false;
         this.startSpinner();

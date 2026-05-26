@@ -48,9 +48,15 @@ export class MelaClient {
   private _token: string;
   private cookies = '';
   private sessionId = '';
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private onTokenRefreshed?: (newToken: string) => void;
 
-  constructor(token: string) {
+  constructor(token: string, opts?: { refreshTokenCookie?: string; onTokenRefreshed?: (token: string) => void }) {
     this._token = token;
+    this.onTokenRefreshed = opts?.onTokenRefreshed;
+    if (opts?.refreshTokenCookie) {
+      this.cookies = mergeCookies(this.cookies, `refresh_token=${opts.refreshTokenCookie}`);
+    }
   }
 
   get token(): string {
@@ -112,8 +118,9 @@ export class MelaClient {
         headers: {
           'Content-Type': 'application/json',
           'Origin': BASE_URL,
+          'Cookie': this.cookies,
+          'Referer': BASE_URL + '/chats',
         },
-        credentials: 'include',
       });
       
       const freshCookies = extractCookies(res.headers);
@@ -124,11 +131,35 @@ export class MelaClient {
       const data = await res.json() as { access_token?: string };
       if (data.access_token) {
         this._token = data.access_token;
+        this.onTokenRefreshed?.(data.access_token);
         return this._token;
       }
       return null;
     } catch {
       return null;
+    }
+  }
+
+  getRefreshTokenCookie(): string | null {
+    const match = this.cookies.match(/refresh_token=([^;]+)/);
+    return match ? match[1] : null;
+  }
+
+  startAutoRefresh(intervalMs = 300_000): void {
+    this.stopAutoRefresh();
+    this.refreshTimer = setInterval(async () => {
+      try {
+        await this.refreshAccessToken();
+      } catch {
+        // Silently retry next interval
+      }
+    }, intervalMs);
+  }
+
+  stopAutoRefresh(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
     }
   }
 
@@ -147,12 +178,12 @@ export class MelaClient {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
         // Refresh session on retry or first use
-        if (!this.sessionId || attempt > 0) {
-          try {
-            await this.createSession();
-          } catch (sessionErr: any) {
-            if (isAuthError(sessionErr.message)) throw sessionErr;
-            lastError = sessionErr;
+          if (!this.sessionId || attempt > 0) {
+            try {
+              await this.createSession();
+            } catch (sessionErr: any) {
+              if (isAuthError(sessionErr.message)) throw sessionErr;
+              lastError = sessionErr;
             if (attempt < MAX_RETRIES - 1) {
               const delay = retryDelay(attempt);
               const msg = `Session creation failed. Retrying in ${delay / 1000}s (attempt ${attempt + 2}/${MAX_RETRIES})...`;
@@ -244,8 +275,15 @@ export class MelaClient {
 
       } catch (err: any) {
         lastError = err;
-        // Don't retry auth errors
-        if (isAuthError(err.message)) throw err;
+        // Try token refresh on auth errors, then retry
+        if (isAuthError(err.message)) {
+          const refreshed = await this.refreshAccessToken();
+          if (refreshed) {
+            this.sessionId = '';
+            continue;
+          }
+          throw err;
+        }
         if (attempt < MAX_RETRIES - 1) {
           const delay = retryDelay(attempt);
           this.sessionId = ''; // Force new session on retry

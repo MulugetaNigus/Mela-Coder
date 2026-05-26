@@ -2,34 +2,47 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const ENV_VAR = 'MELA_TOKEN';
+const REFRESH_ENV_VAR = 'MELA_REFRESH_TOKEN';
 const DEFAULT_ENV_PATH = path.resolve('.env');
 
-export function loadToken(envPath = DEFAULT_ENV_PATH): string | null {
-  const envFile = envPath;
-  if (!existsSync(envFile)) {
-    const token = process.env[ENV_VAR];
-    return token && token.length > 0 ? token : null;
+function readEnvValue(key: string, envPath: string): string | null {
+  if (!existsSync(envPath)) {
+    const val = process.env[key];
+    return val && val.length > 0 ? val : null;
   }
-  
-  const content = readFileSync(envFile, 'utf8');
-  const match = content.match(/^MELA_TOKEN=["']?([^"'\n\r]+)["']?$/m);
+  const content = readFileSync(envPath, 'utf8');
+  const match = content.match(new RegExp(`^${key}=["']?([^"'\\n\\r]+)["']?$`, 'm'));
   return match ? match[1] : null;
 }
 
-export function saveToken(token: string, envPath = DEFAULT_ENV_PATH): void {
+function writeEnvValue(key: string, value: string, envPath: string): void {
   let existing = '';
   if (existsSync(envPath)) {
     existing = readFileSync(envPath, 'utf8');
   }
-  
   const cleaned = existing
     .split('\n')
-    .filter(line => !line.match(/^MELA_TOKEN\s*=/) && line.trim() !== '')
+    .filter(line => !line.match(new RegExp(`^${key}\\s*=`)) && line.trim() !== '')
     .join('\n');
-  
-  const updated = cleaned + (cleaned.endsWith('\n') ? '' : '\n') + `MELA_TOKEN="${token}"\n`;
+  const updated = cleaned + (cleaned.endsWith('\n') ? '' : '\n') + `${key}="${value}"\n`;
   writeFileSync(envPath, updated, 'utf8');
-  process.env[ENV_VAR] = token;
+  process.env[key] = value;
+}
+
+export function loadToken(envPath = DEFAULT_ENV_PATH): string | null {
+  return readEnvValue(ENV_VAR, envPath) ?? process.env[ENV_VAR] ?? null;
+}
+
+export function saveToken(token: string, envPath = DEFAULT_ENV_PATH): void {
+  writeEnvValue(ENV_VAR, token, envPath);
+}
+
+export function loadRefreshToken(envPath = DEFAULT_ENV_PATH): string | null {
+  return readEnvValue(REFRESH_ENV_VAR, envPath) ?? process.env[REFRESH_ENV_VAR] ?? null;
+}
+
+export function saveRefreshToken(token: string, envPath = DEFAULT_ENV_PATH): void {
+  writeEnvValue(REFRESH_ENV_VAR, token, envPath);
 }
 
 export function ensureEnvGitignored(): void {
@@ -53,6 +66,7 @@ export interface TokenRefreshResult {
 
 export async function refreshAccessToken(refreshToken?: string): Promise<TokenRefreshResult> {
   const BASE_URL = 'https://mela.aii.et';
+  const cookieHeader = refreshToken ? `refresh_token=${refreshToken}` : '';
   
   try {
     const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
@@ -60,8 +74,9 @@ export async function refreshAccessToken(refreshToken?: string): Promise<TokenRe
       headers: {
         'Content-Type': 'application/json',
         'Origin': BASE_URL,
+        'Referer': BASE_URL + '/chats',
+        ...(cookieHeader ? { 'Cookie': cookieHeader } : {}),
       },
-      credentials: 'include',
     });
     
     if (!res.ok) {
