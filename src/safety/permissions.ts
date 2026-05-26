@@ -1,4 +1,5 @@
 import readline from 'node:readline';
+import { Renderer } from '../cli/renderer';
 
 export enum PermissionTier {
   READ = 0,
@@ -121,19 +122,75 @@ export class PermissionGate {
   }
 
   private async prompt(tier: PermissionTier, cmdPreview: string): Promise<string> {
-    return new Promise(resolve => {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      const border = yellow('═'.repeat(50));
-      process.stdout.write(`\n${border}\n`);
-      process.stdout.write(`${bold(yellow('  ⚠ Security Gate Permission Required'))}\n\n`);
-      process.stdout.write(`  Tier: ${bold(this.getTierName(tier))}\n`);
-      process.stdout.write(`  Action: ${cyan(cmdPreview)}\n\n`);
-      process.stdout.write(`  ${dim('[A] Allow    [AA] Allow Always    [D] Deny')}\n`);
-      process.stdout.write(`${bold(yellow('  ──'))} `);
-      rl.once('line', line => {
-        rl.close();
-        resolve(line.trim().toLowerCase());
-      });
+    Renderer.stopActiveSpinner();
+    const options = ['Allow', 'Allow Always', 'Deny'];
+    let selectedIndex = 0;
+
+    const border = yellow('═'.repeat(50));
+    process.stdout.write(`\n${border}\n`);
+    process.stdout.write(`${bold(yellow('  ⚠ Security Gate Permission Required'))}\n\n`);
+    process.stdout.write(`  Tier: ${bold(this.getTierName(tier))}\n`);
+    process.stdout.write(`  Action: ${cyan(cmdPreview)}\n\n`);
+
+    const renderOptions = () => {
+      const rendered = options.map((opt, idx) => {
+        if (idx === selectedIndex) {
+          return `\x1b[7m\x1b[1m\x1b[33m[ ${opt} ]\x1b[0m`;
+        } else {
+          return `\x1b[2m  ${opt}  \x1b[0m`;
+        }
+      }).join('   ');
+      process.stdout.write(`\r\x1b[K  ${rendered}`);
+    };
+
+    renderOptions();
+
+    return new Promise<string>(resolve => {
+      const wasRaw = process.stdin.isRaw;
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+
+      const handleKey = (chunk: Buffer) => {
+        const key = chunk.toString();
+
+        if (key === '\u0003') {
+          process.stdin.setRawMode(wasRaw);
+          process.stdin.removeListener('data', handleKey);
+          process.stdout.write('\n');
+          process.exit(130);
+        }
+
+        if (key === '\r' || key === '\n') {
+          process.stdin.setRawMode(wasRaw);
+          process.stdin.removeListener('data', handleKey);
+          process.stdout.write('\n\n');
+          const choice = options[selectedIndex];
+          Renderer.startActiveSpinner();
+          if (choice === 'Allow Always') resolve('aa');
+          if (choice === 'Deny') resolve('d');
+          resolve('a');
+          return;
+        }
+
+        if (key === '\u001b[C' || key === '\t') {
+          selectedIndex = (selectedIndex + 1) % options.length;
+          renderOptions();
+        } else if (key === '\u001b[D') {
+          selectedIndex = (selectedIndex - 1 + options.length) % options.length;
+          renderOptions();
+        }
+
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'a') {
+          selectedIndex = 0;
+          renderOptions();
+        } else if (lowerKey === 'd') {
+          selectedIndex = 2;
+          renderOptions();
+        }
+      };
+
+      process.stdin.on('data', handleKey);
     });
   }
 

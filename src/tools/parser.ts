@@ -81,8 +81,12 @@ export function parseModelResponse(raw: string): ParseResult {
 
 // ─── Mela Fenced-Block Parser ─────────────────────────────────────────────────
 
-// Matches fenced tool blocks: ```tool_name\ncontent``` (handles any line ending)
+// Matches triple-backtick fenced tool blocks: ```tool_name\ncontent```
 const FENCED_TOOL_RE = /```(\w+)[ \t]*\r?\n?([\s\S]*?)```/g;
+
+// Matches single-backtick fenced tool blocks: `tool_name\ncontent`
+// Uses negative lookbehind to avoid matching inside triple backticks
+const SINGLE_FENCED_TOOL_RE = /(?<!`)`(\w+)\r?\n?([\s\S]*?)`/g;
 
 /**
  * Parse Mela model response which uses backtick-fenced tool blocks
@@ -95,7 +99,7 @@ const FENCED_TOOL_RE = /```(\w+)[ \t]*\r?\n?([\s\S]*?)```/g;
  *   ```list_files\n/path\n```
  *   ```done\n``` or text with "done" indicator
  */
-export function parseMelaResponse(raw: string): ParseResult {
+export function parseMelaResponse(raw: string, knownTools?: Set<string>): ParseResult {
   if (typeof raw !== 'string') {
     return {
       thinking: null,
@@ -121,26 +125,40 @@ export function parseMelaResponse(raw: string): ParseResult {
   const errorMatch = cleaned.match(/<error>([\s\S]*?)<\/error>/i) || cleaned.match(/\[error\]\s*(.+?)(?:\n|$)/i);
   const isError = errorMatch ? (errorMatch[1] || errorMatch[0]).trim() : null;
 
-  // Find fenced tool blocks
+  // Find fenced tool blocks (triple and single backtick)
   FENCED_TOOL_RE.lastIndex = 0;
-  const matches = Array.from(cleaned.matchAll(FENCED_TOOL_RE));
+  SINGLE_FENCED_TOOL_RE.lastIndex = 0;
+  const tripleMatches = Array.from(cleaned.matchAll(FENCED_TOOL_RE));
+  const singleMatches = Array.from(cleaned.matchAll(SINGLE_FENCED_TOOL_RE));
+  const matches = [...tripleMatches, ...singleMatches];
   const toolCalls: ParsedToolCall[] = [];
 
   if (matches.length > 0) {
     for (const match of matches) {
       const [, name, content] = match;
+      // P1.1: Skip numeric-only names (e.g. "2026" from filenames in backticks)
+      if (/^\d+$/.test(name)) continue;
+      // P1.1: Skip names that aren't registered tools (prevents ghost tool calls)
+      if (knownTools && knownTools.size > 0 && !knownTools.has(name)) continue;
+      // Skip common language identifiers used in markdown code blocks
+      if (['json', 'javascript', 'typescript', 'python', 'html', 'css', 'bash', 'sh',
+           'sql', 'yaml', 'yml', 'xml', 'java', 'go', 'rust', 'ruby', 'php', 'c',
+           'cpp', 'csharp', 'swift', 'kotlin', 'diff', 'plaintext', 'text', 'markdown',
+           'md', 'toml', 'ini', 'log', 'csv', 'jsx', 'tsx'].includes(name)) continue;
       const params = parseFencedToolParams(name, content);
       toolCalls.push({ name, params });
     }
 
-    return {
-      thinking,
-      toolCall: toolCalls[0],
-      toolCalls,
-      text: null,
-      isDone,
-      isError
-    };
+    if (toolCalls.length > 0) {
+      return {
+        thinking,
+        toolCall: toolCalls[0],
+        toolCalls,
+        text: null,
+        isDone,
+        isError
+      };
+    }
   }
 
   // No tool call — extract visible text
@@ -208,6 +226,23 @@ function parseFencedToolParams(name: string, content: string): Record<string, st
     case 'run_cmd':
     case 'execute_bash':
       return { cmd: stripParamLabel(trimmed) };
+
+    case 'execute_long_running': {
+      // Model may output just the command, or "cmd: <command>", or multi-line
+      const lines = trimmed.split('\n');
+      const firstLine = stripParamLabel(lines[0]).trim();
+      if (lines.length === 1) return { cmd: firstLine };
+      // Multi-line: first line is cmd, rest may be timeout_ms
+      const params: Record<string, string | number | boolean> = { cmd: firstLine };
+      for (const line of lines.slice(1)) {
+        const kvMatch = line.match(/^(\w+)\s*[:=]\s*(.+)$/);
+        if (kvMatch) {
+          const [, key, val] = kvMatch;
+          params[key] = coerceValue(val);
+        }
+      }
+      return params;
+    }
 
     case 'list_dir':
     case 'list_files':
@@ -301,6 +336,15 @@ function parseFencedToolParams(name: string, content: string): Record<string, st
       return { followups: stripParamLabel(trimmed) };
 
     default: {
+      // Try to extract known param patterns: "cmd: value", "path: value", etc.
+      const kvMatch = trimmed.match(/^(cmd|command|path|file_path|query|url|pattern|message|symbol|key|name)\s*[:=]\s*([\s\S]+)$/i);
+      if (kvMatch) {
+        return { [kvMatch[1].toLowerCase()]: coerceValue(kvMatch[2]) };
+      }
+      // Fallback: treat entire content as 'cmd' for command-like tools, or 'content' for others
+      if (name.includes('execute') || name.includes('run') || name.includes('bash') || name.includes('cmd') || name.includes('shell') || name.includes('job') || name.includes('long')) {
+        return { cmd: stripParamLabel(trimmed) };
+      }
       if (typeof trimmed === 'string' && trimmed) {
         return { content: stripParamLabel(trimmed) };
       }

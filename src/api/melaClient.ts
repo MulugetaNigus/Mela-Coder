@@ -17,6 +17,8 @@ export interface GenerateResponse {
 }
 
 const BASE_URL = 'https://mela.aii.et';
+const MAX_RETRIES = 3;
+const BASE_RETRY_DELAY_MS = 1000;
 
 function extractCookies(headers: Headers): string {
   const raw = headers.getSetCookie ? headers.getSetCookie() : [];
@@ -34,13 +36,29 @@ function mergeCookies(existing: string, fresh: string): string {
   return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
+function isAuthError(msg: string): boolean {
+  return /\b(401|403|unauthorized|forbidden)\b/i.test(msg);
+}
+
+function retryDelay(attempt: number): number {
+  return Math.min(BASE_RETRY_DELAY_MS * Math.pow(2, attempt), 10000);
+}
+
 export class MelaClient {
-  private readonly token: string;
+  private _token: string;
   private cookies = '';
   private sessionId = '';
 
   constructor(token: string) {
-    this.token = token;
+    this._token = token;
+  }
+
+  get token(): string {
+    return this._token;
+  }
+
+  set token(newToken: string) {
+    this._token = newToken;
   }
 
   private buildHeaders(): Record<string, string> {
@@ -48,7 +66,7 @@ export class MelaClient {
       'Content-Type': 'application/json',
       'Origin': BASE_URL,
       'Referer': BASE_URL + '/chats',
-      'Authorization': `Bearer ${this.token}`,
+      'Authorization': `Bearer ${this._token}`,
     };
     if (this.cookies) h['Cookie'] = this.cookies;
     return h;
@@ -71,6 +89,49 @@ export class MelaClient {
     return this.sessionId;
   }
 
+  async validateToken(): Promise<{ ok: true } | { ok: false; error: string }> {
+    try {
+      await this.createSession();
+      return { ok: true };
+    } catch (err: any) {
+      const msg = err.message ?? '';
+      if (isAuthError(msg)) {
+        return { ok: false, error: 'Invalid or expired MELA_TOKEN. Check your token and try again.' };
+      }
+      if (msg.includes('fetch failed') || msg.includes('econnrefused') || msg.includes('enotfound')) {
+        return { ok: false, error: 'Cannot reach the Mela API. Check your internet connection.' };
+      }
+      return { ok: false, error: `Mela API error: ${msg}` };
+    }
+  }
+
+  async refreshAccessToken(): Promise<string | null> {
+    try {
+      const res = await fetch(`${BASE_URL}/api/auth/refresh`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Origin': BASE_URL,
+        },
+        credentials: 'include',
+      });
+      
+      const freshCookies = extractCookies(res.headers);
+      if (freshCookies) this.cookies = mergeCookies(this.cookies, freshCookies);
+      
+      if (!res.ok) return null;
+      
+      const data = await res.json() as { access_token?: string };
+      if (data.access_token) {
+        this._token = data.access_token;
+        return this._token;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async *generateStream(
     prompt: string,
     opts: {
@@ -81,80 +142,123 @@ export class MelaClient {
       onStatus?: (status: string) => void;
     } = {}
   ): AsyncGenerator<StreamChunk> {
-    if (!this.sessionId) {
-      await this.createSession();
-    }
+    let lastError: Error | null = null;
 
-    const res = await fetch(`${BASE_URL}/api/chat/stream`, {
-      method: 'POST',
-      headers: this.buildHeaders(),
-      body: JSON.stringify({
-        prompt,
-        session_id: this.sessionId,
-        reasoning: opts.reasoning ? 1 : 0,
-        search: opts.search ? 1 : 0,
-      }),
-    });
-
-    const freshCookies = extractCookies(res.headers);
-    if (freshCookies) this.cookies = mergeCookies(this.cookies, freshCookies);
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-
-    const reader = res.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let fullText = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t) continue;
-        try {
-          const chunk = t.startsWith('data:')
-            ? JSON.parse(t.slice(5).trim())
-            : t.startsWith('{') ? JSON.parse(t) : null;
-          if (!chunk) continue;
-          if (chunk.info || chunk.status) {
-            opts.onStatus?.(chunk.info || chunk.status);
-            yield { text: '', done: false, status: chunk.info || chunk.status };
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        // Refresh session on retry or first use
+        if (!this.sessionId || attempt > 0) {
+          try {
+            await this.createSession();
+          } catch (sessionErr: any) {
+            if (isAuthError(sessionErr.message)) throw sessionErr;
+            lastError = sessionErr;
+            if (attempt < MAX_RETRIES - 1) {
+              const delay = retryDelay(attempt);
+              const msg = `Session creation failed. Retrying in ${delay / 1000}s (attempt ${attempt + 2}/${MAX_RETRIES})...`;
+              opts.onStatus?.(msg);
+              yield { text: '', done: false, status: msg };
+              await new Promise(r => setTimeout(r, delay));
+              continue;
+            }
+            throw sessionErr;
           }
-          if (chunk.token) {
-            fullText += chunk.token;
-            opts.onToken?.(chunk.token);
-            yield { text: chunk.token, done: false };
+        }
+
+        const res = await fetch(`${BASE_URL}/api/chat/stream`, {
+          method: 'POST',
+          headers: this.buildHeaders(),
+          body: JSON.stringify({
+            prompt,
+            session_id: this.sessionId,
+            reasoning: opts.reasoning ? 1 : 0,
+            search: opts.search ? 1 : 0,
+          }),
+        });
+
+        const freshCookies = extractCookies(res.headers);
+        if (freshCookies) this.cookies = mergeCookies(this.cookies, freshCookies);
+        if (!res.ok) {
+          const errText = await res.text();
+          const errMsg = `HTTP ${res.status}: ${errText}`;
+          if (isAuthError(errMsg)) throw new Error(errMsg);
+          throw new Error(errMsg);
+        }
+
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let fullText = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t) continue;
+            try {
+              const chunk = t.startsWith('data:')
+                ? JSON.parse(t.slice(5).trim())
+                : t.startsWith('{') ? JSON.parse(t) : null;
+              if (!chunk) continue;
+              if (chunk.info || chunk.status) {
+                opts.onStatus?.(chunk.info || chunk.status);
+                yield { text: '', done: false, status: chunk.info || chunk.status };
+              }
+              if (chunk.token) {
+                fullText += chunk.token;
+                opts.onToken?.(chunk.token);
+                yield { text: chunk.token, done: false };
+              }
+              if (chunk.reasoning) {
+                opts.onReasoning?.(chunk.reasoning);
+                yield { text: '', done: false, reasoning: chunk.reasoning };
+              }
+              if (chunk.error) throw new Error('Server error: ' + chunk.error);
+            } catch (e: any) {
+              if (e.message.startsWith('Server error:')) throw e;
+            }
           }
-          if (chunk.reasoning) {
-            opts.onReasoning?.(chunk.reasoning);
-            yield { text: '', done: false, reasoning: chunk.reasoning };
-          }
-          if (chunk.error) throw new Error('Server error: ' + chunk.error);
-        } catch (e: any) {
-          if (e.message.startsWith('Server error:')) throw e;
+        }
+        // Process remaining buffer
+        if (buffer.trim()) {
+          const t = buffer.trim();
+          try {
+            const chunk = t.startsWith('data:')
+              ? JSON.parse(t.slice(5).trim())
+              : t.startsWith('{') ? JSON.parse(t) : null;
+            if (chunk) {
+              if (chunk.token) {
+                fullText += chunk.token;
+                opts.onToken?.(chunk.token);
+                yield { text: chunk.token, done: false };
+              }
+            }
+          } catch { /* skip */ }
+        }
+        yield { text: '', done: true };
+        return; // Success — exit retry loop
+
+      } catch (err: any) {
+        lastError = err;
+        // Don't retry auth errors
+        if (isAuthError(err.message)) throw err;
+        if (attempt < MAX_RETRIES - 1) {
+          const delay = retryDelay(attempt);
+          this.sessionId = ''; // Force new session on retry
+          const msg = `Stream failed: ${err.message}. Retrying in ${delay / 1000}s (${attempt + 2}/${MAX_RETRIES})...`;
+          opts.onStatus?.(msg);
+          yield { text: '', done: false, status: msg };
+          await new Promise(r => setTimeout(r, delay));
+          continue;
         }
       }
     }
-    // Process remaining buffer
-    if (buffer.trim()) {
-      const t = buffer.trim();
-      try {
-        const chunk = t.startsWith('data:')
-          ? JSON.parse(t.slice(5).trim())
-          : t.startsWith('{') ? JSON.parse(t) : null;
-        if (chunk) {
-          if (chunk.token) {
-            fullText += chunk.token;
-            opts.onToken?.(chunk.token);
-            yield { text: chunk.token, done: false };
-          }
-        }
-      } catch { /* skip */ }
-    }
-    yield { text: '', done: true };
+
+    throw lastError ?? new Error('Max retries exceeded');
   }
 
   /**

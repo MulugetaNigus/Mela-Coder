@@ -37,8 +37,8 @@ export const writeFileTool: ToolDefinition = {
       await fs.writeFile(tmpPath, params.content, 'utf8');
       await fs.rename(tmpPath, filePath);
       const bytes = Buffer.byteLength(params.content, 'utf8');
-      const preview = params.content.split(/\r?\n/).slice(0, 5).join('\n');
-      return { success: true, output: `Written ${bytes} bytes to ${params.path}\nResolved: ${filePath}\nPreview:\n${preview}` };
+      const lines = params.content.split(/\r?\n/).length;
+      return { success: true, output: `Written ${bytes} bytes to ${params.path}\nResolved: ${filePath}\nLines: ${lines}` };
     } catch (err: any) {
       return { success: false, output: '', error: err?.message ?? 'Failed to write file' };
     }

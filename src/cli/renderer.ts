@@ -64,6 +64,17 @@ function summarizeToolOutput(name: string, output: string, debug: boolean): stri
   return lines.slice(0, 8).join('\n');
 }
 
+function shouldSuppressThinkingLine(line: string): boolean {
+  // Suppress lines that are primarily tool call references (visual noise since tool_call event handles this)
+  const toolRefRe = /^(?:i['']ll|let me|i need to|now|i should|i will|i['']m going to)\s+(call|use|run|read|write|list|search)\s+[\w`]/i;
+  if (toolRefRe.test(line.trim())) return true;
+  // Suppress lines that are just tool fence markers
+  if (/^```?\w+/.test(line.trim())) return true;
+  // Suppress standalone 'Thought' lines — they're handled with proper formatting in stream_chunk
+  if (/^Thought\s*[·:]/.test(line.trim())) return true;
+  return false;
+}
+
 function formatParamValue(value: unknown): string {
   if (typeof value === 'string') return truncateValue(value.replace(/\n/g, '\\n'), 160);
   return truncateValue(JSON.stringify(value) ?? String(value), 160);
@@ -122,8 +133,26 @@ function renderToolCallPrefix(name: string, params: Record<string, unknown>): st
   }
 }
 
-function renderMarkdown(text: string, chalk: ChalkLike): string {
+function renderMarkdown(text: string, chalk: ChalkLike, insideCodeBlockRef?: { value: boolean }): string {
   let result = text;
+
+  if (insideCodeBlockRef) {
+    const trimmed = result.trim();
+    if (trimmed.startsWith('```')) {
+      insideCodeBlockRef.value = !insideCodeBlockRef.value;
+      if (insideCodeBlockRef.value) {
+        // Opening fence — subtle dim separator
+        return chalk.dim('  ╌╌╌');
+      } else {
+        // Closing fence — subtle dim separator
+        return chalk.dim('  ╌╌╌');
+      }
+    }
+    if (insideCodeBlockRef.value) {
+      // Render code line in green for visual distinction
+      return chalk.green(result);
+    }
+  }
 
   // Normalize list indentation: strip leading whitespace from list marker lines
   // so consecutive items align consistently regardless of model formatting
@@ -157,6 +186,9 @@ function renderMarkdown(text: string, chalk: ChalkLike): string {
   // Inline code
   result = result.replace(/`(.*?)`/g, chalk.gray('$1'));
 
+  // Highlight markdown links: [label](url)
+  result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, url) => `${chalk.blue(label)} (${chalk.dim(url)})`);
+
   return result;
 }
 
@@ -165,14 +197,24 @@ const LOADING_FRAMES = [
 ];
 
 const LOADING_LABELS = [
-  'orchestrating sub-agents',
-  'analyzing workspace',
-  'compiling context',
-  'synthesizing edits',
-  'formulating execution plan'
+  'thinking',
+  'analyzing',
+  'processing',
+  'working',
+  'thinking'
 ];
 
+const KNOWN_TOOLS = new Set([
+  'read_file', 'write_file', 'edit_file', 'str_replace', 'delete_file',
+  'execute_bash', 'run_cmd', 'list_dir', 'list_files', 'glob',
+  'search_files', 'grep', 'find_files', 'git_status', 'git_diff',
+  'git_log', 'read_github_issue', 'read_github_file', 'fetch_url', 'done'
+]);
+
+const FILENAME_RE = /^[\w\-./]+\.(html?|css|js|ts|jsx|tsx|py|rb|go|rs|java|c|cpp|vue|svelte|php|json|md|yaml|yml|xml|sql|sh|bash)$/i;
+
 export class Renderer {
+  public static activeInstance: Renderer | null = null;
   private spinnerTimer: NodeJS.Timeout | null = null;
   private spinnerFrame = 0;
   private spinnerLabelFrame = 0;
@@ -186,8 +228,28 @@ export class Renderer {
   private toolCallPrefix = '';
   private toolCallLabel = '';
   private toolCallParamStr = '';
+  private insideToolCall = false;
+  private toolCallMarker = '';
+  private toolColor: any = null;
+  private insideMarkdownCodeBlock = false;
+  private thinkingLineLength = 0;
+  private insideThoughtBlock = false;
 
-  constructor(private debug = false) {}
+  constructor(private debug = false) {
+    Renderer.activeInstance = this;
+  }
+
+  public static stopActiveSpinner(): void {
+    if (Renderer.activeInstance) {
+      Renderer.activeInstance.stopSpinner();
+    }
+  }
+
+  public static startActiveSpinner(): void {
+    if (Renderer.activeInstance) {
+      Renderer.activeInstance.startSpinner();
+    }
+  }
 
   setDebug(debug: boolean): void {
     this.debug = debug;
@@ -199,7 +261,24 @@ export class Renderer {
     return `${(ms / 1000).toFixed(1)}s`;
   }
 
-  private startSpinner(): void {
+  private wrapLine(line: string, maxWidth: number): string[] {
+    if (line.length <= maxWidth) return [line];
+    const words = line.split(/(\s+)/);
+    const result: string[] = [];
+    let current = '';
+    for (const word of words) {
+      if ((current + word).length > maxWidth && current.trim()) {
+        result.push(current.trim());
+        current = word;
+      } else {
+        current += word;
+      }
+    }
+    if (current.trim()) result.push(current.trim());
+    return result;
+  }
+
+  public startSpinner(): void {
     if (this.spinnerTimer) return;
     this.spinnerFrame = 0;
     this.spinnerLabelFrame = 0;
@@ -212,7 +291,7 @@ export class Renderer {
     }, 60);
   }
 
-  private stopSpinner(): void {
+  public stopSpinner(): void {
     if (!this.spinnerTimer) return;
     clearInterval(this.spinnerTimer);
     this.spinnerTimer = null;
@@ -251,12 +330,60 @@ export class Renderer {
   async render(event: AgentEvent): Promise<void> {
     const chalk = await getChalk();
     switch (event.type) {
+      case 'thinking_start': {
+        this.stopSpinner();
+        this.modelResponded = true;
+        this.thinkingLineLength = 0;
+        process.stdout.write(`\n  ${chalk.blue('Thinking...')}\n  ${chalk.dim('│')} `);
+        break;
+      }
+      case 'thinking_chunk': {
+        const text = event.content;
+        const termWidth = process.stdout.columns || 80;
+        const maxLen = Math.max(termWidth - 8, 40);
+
+        for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+          if (char === '\n') {
+            process.stdout.write(`\n  ${chalk.dim('│')} `);
+            this.thinkingLineLength = 0;
+          } else {
+            if (this.thinkingLineLength >= maxLen) {
+              process.stdout.write(`\n  ${chalk.dim('│')} `);
+              this.thinkingLineLength = 0;
+            }
+            process.stdout.write(chalk.gray(char));
+            this.thinkingLineLength++;
+          }
+        }
+        break;
+      }
+      case 'thinking_end': {
+        process.stdout.write('\n\n');
+        break;
+      }
       case 'thinking': {
         this.stopSpinner();
         this.modelResponded = true;
         const content = event.content.trim();
-        if (content) {
-          process.stdout.write(`  ${chalk.blue('thinking')} ${chalk.dim('·')} ${chalk.gray(content)}\n`);
+        if (!content) break;
+
+        const termWidth = process.stdout.columns || 80;
+        const contentWidth = termWidth - 8; // 2 indent + 3 gutter + 3 padding
+        const gutter = chalk.dim('│');
+
+        // Header line
+        process.stdout.write(`  ${chalk.blue('Thinking...')}\n`);
+
+        // Content lines with left gutter
+        const lines = content.split('\n');
+        for (const line of lines) {
+          if (shouldSuppressThinkingLine(line)) continue;
+          // Word-wrap each line
+          const wrapped = this.wrapLine(line, contentWidth);
+          for (let i = 0; i < wrapped.length; i++) {
+            process.stdout.write(`  ${gutter} ${chalk.gray(wrapped[i])}\n`);
+          }
         }
         break;
       }
@@ -268,6 +395,7 @@ export class Renderer {
         break;
       }
       case 'status':
+        if (!this.debug) break;
         this.stopSpinner();
         process.stdout.write(`  ${chalk.cyan('i')} ${chalk.dim(event.content)}\n`);
         break;
@@ -275,44 +403,162 @@ export class Renderer {
         this.streamBuffer = '';
         this.lastFlushedIndex = 0;
         this.streamStarted = false;
+        this.insideToolCall = false;
+        this.toolCallMarker = '';
+        this.insideThoughtBlock = false;
+        this.thinkingLineLength = 0;
         break;
       case 'stream_chunk': {
         const text = event.content.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '');
         this.streamBuffer += text;
         let newlineIdx;
         while ((newlineIdx = this.streamBuffer.indexOf('\n', this.lastFlushedIndex)) !== -1) {
+          const line = this.streamBuffer.slice(this.lastFlushedIndex, newlineIdx);
+          const trimmedLine = line.trim();
+          this.lastFlushedIndex = newlineIdx + 1;
+
+          // Check if we are inside a tool call fence to suppress raw print
+          if (this.insideToolCall) {
+            if (trimmedLine === this.toolCallMarker || (this.toolCallMarker && trimmedLine.endsWith(this.toolCallMarker))) {
+              this.insideToolCall = false;
+            }
+            continue;
+          }
+
+          // Detect new tool call fence open
+          const toolMatch = trimmedLine.match(/^```?(\w+)\s*$/);
+          if (toolMatch && KNOWN_TOOLS.has(toolMatch[1])) {
+            this.insideToolCall = true;
+            this.toolCallMarker = line.includes('```') ? '```' : '`';
+            this.insideThoughtBlock = false; // Turn off thoughts on tool calls
+            continue;
+          }
+
+          // Suppress raw file header lines (e.g. standalone "2026-05-25.html")
+          if (FILENAME_RE.test(trimmedLine)) {
+            continue;
+          }
+
           this.stopSpinner();
           this.hasVisibleOutput = true;
           this.modelResponded = true;
-          const line = this.streamBuffer.slice(this.lastFlushedIndex, newlineIdx);
-          if (!this.streamStarted) {
-            process.stdout.write(`\n  `);
-            this.streamStarted = true;
+
+          // Detect 'Thought · ' or 'Thought:' lines and render with Thinking header + gutter format
+          const thoughtMatch = trimmedLine.match(/^\+?\s*(?:Thought|Thinking)\s*[·:]\s*(.*)$/i);
+          if (thoughtMatch) {
+            this.insideThoughtBlock = true;
+            if (!this.streamStarted) {
+              process.stdout.write(`\n`);
+              this.streamStarted = true;
+            }
+            process.stdout.write(`  ${chalk.blue('Thinking...')}\n`);
+            
+            const content = thoughtMatch[1].trim();
+            if (content) {
+              const termWidth = process.stdout.columns || 80;
+              const contentWidth = termWidth - 8;
+              const gutter = chalk.dim('│');
+              const wrapped = this.wrapLine(content, contentWidth);
+              for (const w of wrapped) {
+                process.stdout.write(`  ${gutter} ${chalk.gray(w)}\n`);
+              }
+            }
+            continue;
           }
-          process.stdout.write(renderMarkdown(line, chalk) + '\n');
-          this.lastFlushedIndex = newlineIdx + 1;
+
+          // If we are currently inside a thought block, keep formatting lines inside the Thinking block
+          if (this.insideThoughtBlock) {
+            const termWidth = process.stdout.columns || 80;
+            const contentWidth = termWidth - 8;
+            const gutter = chalk.dim('│');
+
+            if (trimmedLine) {
+              const wrapped = this.wrapLine(line, contentWidth);
+              for (const w of wrapped) {
+                process.stdout.write(`  ${gutter} ${chalk.gray(w)}\n`);
+              }
+            } else {
+              process.stdout.write(`  ${gutter}\n`);
+            }
+            continue;
+          }
+
+          if (trimmedLine && !shouldSuppressThinkingLine(line)) {
+            const ref = { value: this.insideMarkdownCodeBlock };
+            const rendered = renderMarkdown(line, chalk, ref);
+            this.insideMarkdownCodeBlock = ref.value;
+            if (!this.streamStarted) {
+              process.stdout.write(`\n  💬 ${rendered}\n`);
+              this.streamStarted = true;
+            } else {
+              process.stdout.write(`     ${rendered}\n`);
+            }
+          } else if (!trimmedLine) {
+            if (this.streamStarted) {
+              process.stdout.write(`\n`);
+            }
+          }
         }
         break;
       }
       case 'stream_end': {
         const remaining = this.streamBuffer.slice(this.lastFlushedIndex);
-        if (remaining || !this.streamStarted) {
+        const lines = remaining.split('\n');
+        let filteredLines: string[] = [];
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (this.insideToolCall) {
+            if (trimmed === this.toolCallMarker || (this.toolCallMarker && trimmed.endsWith(this.toolCallMarker))) {
+              this.insideToolCall = false;
+            }
+            continue;
+          }
+          const toolMatch = trimmed.match(/^```?(\w+)\s*$/);
+          if (toolMatch && KNOWN_TOOLS.has(toolMatch[1])) {
+            this.insideToolCall = true;
+            this.toolCallMarker = line.includes('```') ? '```' : '`';
+            continue;
+          }
+          if (FILENAME_RE.test(trimmed)) {
+            continue;
+          }
+          filteredLines.push(line);
+        }
+
+        const filteredRemaining = filteredLines.filter(l => !shouldSuppressThinkingLine(l)).join('\n');
+        if (filteredRemaining.trim()) {
           this.stopSpinner();
           this.hasVisibleOutput = true;
           this.modelResponded = true;
-          if (!this.streamStarted) {
-            process.stdout.write(`\n  `);
-            this.streamStarted = true;
+          const remainingLines = filteredRemaining.split('\n');
+          for (const line of remainingLines) {
+            const trimmed = line.trim();
+            if (trimmed) {
+              const ref = { value: this.insideMarkdownCodeBlock };
+              const rendered = renderMarkdown(line, chalk, ref);
+              this.insideMarkdownCodeBlock = ref.value;
+              if (!this.streamStarted) {
+                process.stdout.write(`\n  💬 ${rendered}\n`);
+                this.streamStarted = true;
+              } else {
+                process.stdout.write(`     ${rendered}\n`);
+              }
+            } else {
+              if (this.streamStarted) {
+                process.stdout.write(`\n`);
+              }
+            }
           }
-          process.stdout.write(renderMarkdown(remaining, chalk));
         }
         if (this.streamStarted) {
-          if (remaining) process.stdout.write('\n');
           process.stdout.write('\n');
         }
         this.streamBuffer = '';
         this.lastFlushedIndex = 0;
         this.streamStarted = false;
+        this.insideToolCall = false;
+        this.toolCallMarker = '';
         break;
       }
       case 'text': {
@@ -320,13 +566,58 @@ export class Renderer {
         if (!this.hasVisibleOutput) {
           this.hasVisibleOutput = true;
           this.modelResponded = true;
-          const cleaned = event.content
-            .replace(/^```[\w]*\s*$/gm, '')
+          const lines = event.content.split('\n');
+          let filteredLines: string[] = [];
+          let tempInside = false;
+          let tempMarker = '';
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (tempInside) {
+              if (trimmed === tempMarker || (tempMarker && trimmed.endsWith(tempMarker))) {
+                tempInside = false;
+              }
+              continue;
+            }
+            const toolMatch = trimmed.match(/^```?(\w+)\s*$/);
+            if (toolMatch && KNOWN_TOOLS.has(toolMatch[1])) {
+              tempInside = true;
+              tempMarker = line.includes('```') ? '```' : '`';
+              continue;
+            }
+            if (FILENAME_RE.test(trimmed)) {
+              continue;
+            }
+            filteredLines.push(line);
+          }
+
+          const cleaned = filteredLines
+            .join('\n')
             .replace(/\[done\]/gi, '')
             .replace(/<done\s*\/>/gi, '')
             .trim();
           if (cleaned) {
-            process.stdout.write(`\n  ${renderMarkdown(cleaned, chalk)}\n\n`);
+            const cleanedLines = cleaned.split('\n');
+            let textOutput = '';
+            let tempStarted = false;
+            const ref = { value: false };
+            for (const line of cleanedLines) {
+              const trimmed = line.trim();
+              if (trimmed) {
+                const rendered = renderMarkdown(line, chalk, ref);
+                if (!tempStarted) {
+                  textOutput += `\n  💬 ${rendered}\n`;
+                  tempStarted = true;
+                } else {
+                  textOutput += `     ${rendered}\n`;
+                }
+              } else {
+                if (tempStarted) {
+                  textOutput += `\n`;
+                }
+              }
+            }
+            process.stdout.write(textOutput + '\n');
           }
         }
         break;
@@ -335,36 +626,45 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         this.modelResponded = true;
-        
-        const isCmd = event.name === 'execute_bash' || event.name === 'run_cmd';
-        const isSearch = event.name === 'glob' || event.name === 'search_files' || event.name === 'grep' || event.name === 'find_files';
-        const color = isCmd ? chalk.yellow : isSearch ? chalk.magenta : chalk.cyan;
-        const icon = isCmd ? '>' : isSearch ? '?' : '*';
-        
-        process.stdout.write(`\n  ${color(icon)} ${chalk.bold(event.name)}\n`);
-        
+
         const pathStr = (event.params.path ?? event.params.file_path ?? event.params.target_file ?? '') as string;
-        if (pathStr) {
-          process.stdout.write(`  ${color('|')} ${chalk.dim('path:')} ${chalk.white(pathStr)}\n`);
-        }
         const cmdStr = (event.params.cmd ?? event.params.command ?? '') as string;
-        if (cmdStr) {
-          process.stdout.write(`  ${color('|')} ${chalk.dim('command:')} ${chalk.yellow(cmdStr.trim())}\n`);
-        }
-        
-        const skipKeys = new Set(['content', 'old_string', 'new_string', 'oldString', 'newString', 'cmd', 'command', 'path', 'file_path']);
-        for (const [key, value] of Object.entries(event.params)) {
-          if (skipKeys.has(key)) continue;
-          const formatted = formatParamValue(value);
-          if (formatted) {
-            process.stdout.write(`  ${color('|')} ${chalk.dim(key + ':')} ${formatted}\n`);
-          }
-        }
-        
-        this.toolCallPrefix = color('|');
-        this.toolCallLabel = event.name;
-        this.toolCallParamStr = pathStr || cmdStr ? ` (${pathStr || cmdStr})` : '';
-        
+
+        // Map tool names to emoji icons, action labels, and high-fidelity colors
+        const toolMap: Record<string, { icon: string; label: string; color: any }> = {
+          read_file: { icon: '📄', label: 'read', color: chalk.blue },
+          write_file: { icon: '📝', label: 'write', color: chalk.yellow },
+          edit_file: { icon: '✏️', label: 'edit', color: chalk.yellow },
+          str_replace: { icon: '✏️', label: 'edit', color: chalk.yellow },
+          delete_file: { icon: '🗑️', label: 'delete', color: chalk.red },
+          execute_bash: { icon: '⚡', label: 'bash', color: chalk.cyan },
+          run_cmd: { icon: '⚡', label: 'cmd', color: chalk.cyan },
+          list_dir: { icon: '📂', label: 'list', color: chalk.blue },
+          list_files: { icon: '📂', label: 'list', color: chalk.blue },
+          glob: { icon: '🔍', label: 'search', color: chalk.blue },
+          search_files: { icon: '🔍', label: 'search', color: chalk.blue },
+          grep: { icon: '🔍', label: 'search', color: chalk.blue },
+          find_files: { icon: '🔍', label: 'find', color: chalk.blue },
+          git_status: { icon: '🔧', label: 'git status', color: chalk.magenta },
+          git_diff: { icon: '🔧', label: 'git diff', color: chalk.magenta },
+          git_log: { icon: '🔧', label: 'git log', color: chalk.magenta },
+          read_github_issue: { icon: '🌐', label: 'fetch', color: chalk.blue },
+          read_github_file: { icon: '🌐', label: 'fetch', color: chalk.blue },
+          fetch_url: { icon: '🌐', label: 'fetch', color: chalk.blue },
+        };
+
+        const tool = toolMap[event.name] || { icon: '⚙️', label: event.name, color: chalk.white };
+        const displayName = pathStr || cmdStr || (event.params.pattern as string) || (event.params.url as string) || '';
+        const displayLabel = tool.label || '';
+        const color = tool.color;
+
+        // Print compact, clean, single line: icon + action + path/command
+        const formattedLabel = `${tool.icon} ${displayLabel} ${displayName}`.trim();
+        process.stdout.write(`  ${color(formattedLabel)}\n`);
+
+        this.toolCallLabel = formattedLabel;
+        this.toolColor = color;
+
         this.startSpinner();
         break;
       }
@@ -372,10 +672,14 @@ export class Renderer {
         this.stopSpinner();
         this.hasVisibleOutput = true;
         const elapsed = this.elapsed();
-        const color = event.success ? chalk.green : chalk.red;
-        const statusSymbol = event.success ? '+' : '-';
+        const statusSymbol = event.success ? '✓' : '✗';
+
+        // Move cursor up 1 line and clear it to overwrite the tool_call header
+        process.stdout.write('\x1b[1A\x1b[2K');
         
-        process.stdout.write(`  ${color(statusSymbol)} ${chalk.bold(this.toolCallLabel)}${chalk.dim(this.toolCallParamStr)} completed ${chalk.dim(`· ${elapsed}`)}\n`);
+        // Print beautiful, minimal status badge
+        const badge = statusSymbol === '✓' ? chalk.green(statusSymbol) : chalk.red(statusSymbol);
+        process.stdout.write(`  ${badge} ${this.toolCallLabel} ${chalk.dim(`· ${elapsed}`)}\n`);
         
         const fileCrudOps = new Set(['read_file', 'write_file', 'edit_file', 'str_replace', 'delete_file']);
         if (!fileCrudOps.has(event.name)) {
@@ -384,12 +688,13 @@ export class Renderer {
             if (event.name === 'list_dir') {
               const tree = formatFileTree(output, chalk);
               const treeLines = tree.split('\n');
-              const displayTree = treeLines.length > 5 
-                ? `${treeLines.slice(0, 5).join('\n')}\n${chalk.dim('...')}`
+              const displayTree = treeLines.length > 10 
+                ? `${treeLines.slice(0, 10).join('\n')}\n${chalk.dim('...')}`
                 : tree;
               
-              const formattedTree = displayTree.split('\n').map(line => `  ${color('|')} ${line}`).join('\n');
-              process.stdout.write(`${formattedTree}\n`);
+              // Indent the output cleanly by 4 spaces
+              const formattedOut = displayTree.split('\n').map(line => `    ${line}`).join('\n');
+              process.stdout.write(`${formattedOut}\n`);
             } else if (event.name === 'execute_bash' || event.name === 'run_cmd') {
               const cleanOutput = output
                 .replace(/^STDOUT:\n?/, '')
@@ -397,8 +702,18 @@ export class Renderer {
                 .replace(/^Exit code: \d+\n?/, '')
                 .trim();
               if (cleanOutput) {
-                const formattedOut = cleanOutput.split('\n').map(line => `  ${color('|')} ${chalk.gray(line)}`).join('\n');
+                const outLines = cleanOutput.split('\n');
+                let displayLines = outLines;
+                let truncated = false;
+                if (outLines.length > 12) {
+                  displayLines = outLines.slice(0, 12);
+                  truncated = true;
+                }
+                const formattedOut = displayLines.map(line => `    ${chalk.gray(line)}`).join('\n');
                 process.stdout.write(`${formattedOut}\n`);
+                if (truncated) {
+                  process.stdout.write(`    ${chalk.yellow(`... (${outLines.length - 12} more lines truncated)`)}\n`);
+                }
               }
             } else if (event.name === 'web_search') {
               const results = output.split('\n\n');
@@ -409,17 +724,27 @@ export class Renderer {
                 const url = lines.length > 1 ? lines[1] : '';
                 const snippet = lines.length > 2 ? lines.slice(2).join('\n') : '';
                 
-                process.stdout.write(`  ${color('|')} ${chalk.bold(title)}\n`);
-                if (url) process.stdout.write(`  ${color('|')}   ${chalk.dim(url)}\n`);
-                if (snippet) process.stdout.write(`  ${color('|')}   ${chalk.gray(snippet)}\n`);
+                process.stdout.write(`    ${chalk.bold(title)}\n`);
+                if (url) process.stdout.write(`      ${chalk.dim(url)}\n`);
+                if (snippet) process.stdout.write(`      ${chalk.gray(snippet)}\n`);
               }
             } else {
-              const formattedOut = output.split('\n').map(line => `  ${color('|')} ${chalk.gray(line)}`).join('\n');
+              const outLines = output.split('\n');
+              let displayLines = outLines;
+              let truncated = false;
+              if (outLines.length > 10) {
+                displayLines = outLines.slice(0, 10);
+                truncated = true;
+              }
+              const formattedOut = displayLines.map(line => `    ${chalk.gray(line)}`).join('\n');
               process.stdout.write(`${formattedOut}\n`);
+              if (truncated) {
+                process.stdout.write(`    ${chalk.yellow(`... (${outLines.length - 10} more lines truncated)`)}\n`);
+              }
             }
           }
         }
-        process.stdout.write('\n');
+
         this.iterationStart = Date.now();
         break;
       }
@@ -453,7 +778,7 @@ export class Renderer {
             }
             return chalk.dim(trimmed);
           });
-          process.stdout.write(`  ${parts.join(chalk.dim(' · '))} \n`);
+          process.stdout.write(`  ${parts.join(chalk.dim(' · '))}\n`);
         } else {
           process.stdout.write(`  ${chalk.dim('•')} ${chalk.dim(event.content)}\n`);
         }

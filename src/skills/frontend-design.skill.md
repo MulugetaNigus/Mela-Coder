@@ -89,3 +89,14 @@ Tailwind v4 is radically different from v3:
      ```
 - Only fallback to `npx tailwindcss init -p` and traditional configs if you see Tailwind v3.x is explicitly specified in package.json.
 
+════════════════════════════════════════════════
+MANDATORY EXECUTION — SAVE GENERATED CODE
+════════════════════════════════════════════════
+When the user asks you to build, construct, or implement a design or UI/UX mock/app:
+1. Generate the complete code.
+2. ALWAYS call `write_file` to save it to disk. This is required — outputting code as chat text is not acceptable.
+3. NEVER output file body content as chat text. Chat text is for status messages only (e.g. "Written to index.html").
+4. After write_file succeeds, confirm briefly: `Written to index.html` — one line, no more.
+
+If the user ONLY asks to create or touch a file without specifying UI content or design instructions, create it empty or with only the requested content (do not speculatively write unsolicited HTML/code boilerplate).
+

@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import { readFileSync, existsSync } from 'node:fs';
-import os from 'node:os';
+import * as os from 'node:os';
 import path from 'node:path';
 import { MelaClient } from '../api/melaClient';
 import { createDefaultRegistry } from '../tools/defaultRegistry';
@@ -13,48 +13,90 @@ import { SkillLoader } from '../skills/loader';
 import { PermissionGate } from '../safety/permissions';
 import { ProjectMemory } from '../memory/project';
 import { VerificationChain } from '../verification/chain';
+import { EnhancedVerificationChain } from '../verification/languageAware';
+import { StateMachine, AgentState } from './stateMachine';
+import { TaskOrchestrator } from './taskOrchestrator';
+import { ResultClass } from '../verification/chain';
+import { MemoryManager } from '../memory/memoryManager';
 
-function filterToolFence(
+const RAW_FILE_START_RE = /^[\w\-. ]+\.(html?|css|js|ts|jsx|tsx|py|rb|go|rs|java|c|cpp|vue|svelte|php|json|md|yaml|yml|xml|sql|sh|bash|env)\s*$/mi;
+const RAW_FILE_CONTENT_RE = /^(?:<!DOCTYPE|<html|<script|<style|<\?|<svg|<!doctype|@import|import\s+|export\s+|const\s+|let\s+|var\s+|function\s+|class\s+|interface\s+|type\s+|def\s+|pub\s+fn|fn\s+|package\s+|\#include|\#ifndef)/i;
+
+function filterToolAndFileFence(
   chunk: string,
   toolNames: Set<string>,
-  insideFence: { value: boolean }
+  insideFence: { value: boolean },
+  insideFileContent: { value: boolean }
 ): string {
   let result = '';
   let remaining = chunk;
 
   while (remaining.length > 0) {
+    // ── Inside tool fence: skip until close ──
     if (insideFence.value) {
-      const closeIdx = remaining.indexOf('```');
+      const closeTriple = remaining.indexOf('```');
+      const closeSingle = remaining.indexOf('`');
+      const closeIdx = closeTriple >= 0 && (closeSingle < 0 || closeTriple <= closeSingle) ? closeTriple : closeSingle;
       if (closeIdx < 0) return result;
       insideFence.value = false;
-      remaining = remaining.slice(closeIdx + 3);
+      remaining = remaining.slice(closeIdx + (closeIdx === closeTriple ? 3 : 1));
       continue;
     }
 
+    // ── Inside raw file content: skip until end ──
+    if (insideFileContent.value) {
+      // File content ends when we see a tool fence open, or at end of chunk
+      const toolOpenRe = /```(\w+)/;
+      const toolMatch = remaining.match(toolOpenRe);
+      if (toolMatch && toolNames.has(toolMatch[1])) {
+        insideFileContent.value = false;
+        // Don't consume the match — let the tool fence handler deal with it next iteration
+        continue;
+      }
+      // Also end if model starts a new thought or explanatory text
+      const endRe = /^(?:```|\n\s*(?:Thought|\+ |Let me|I should|I need|I'll|Now |Here's |This |\d+\.\s|\[done\]))/m;
+      const endMatch = remaining.match(endRe);
+      if (endMatch) {
+        insideFileContent.value = false;
+        result += remaining.slice(0, endMatch.index);
+        remaining = remaining.slice(endMatch.index);
+        continue;
+      }
+      return result;
+    }
+
+    // ── Check for tool fence open (triple or single backtick) ──
     const openRe = /```(\w+)/;
     const match = remaining.match(openRe);
-    if (!match || !toolNames.has(match[1])) {
-      result += remaining;
+    const singleRe = /(?<!`)`(\w+)/;
+    const singleMatch = remaining.match(singleRe);
+
+    const toolName = match && toolNames.has(match[1]) ? match[1] : (singleMatch && toolNames.has(singleMatch[1]) ? singleMatch[1] : null);
+    if (toolName) {
+      const fullMatch = toolName === match?.[1] ? match : singleMatch!;
+      result += remaining.slice(0, fullMatch.index);
+      const afterOpen = remaining.slice(fullMatch.index! + fullMatch[0].length);
+      const closeTripleIdx = afterOpen.indexOf('```');
+      const closeSingleIdx = afterOpen.indexOf('`');
+      const closeIdx = closeTripleIdx >= 0 && (closeSingleIdx < 0 || closeTripleIdx <= closeSingleIdx) ? closeTripleIdx : closeSingleIdx;
+
+      if (closeIdx >= 0) {
+        remaining = afterOpen.slice(closeIdx + (closeIdx === closeTripleIdx ? 3 : 1));
+        continue;
+      }
+      insideFence.value = true;
       break;
     }
 
-    result += remaining.slice(0, match.index);
-    const afterOpen = remaining.slice(match.index! + match[0].length);
-    const closeIdx = afterOpen.indexOf('```');
-
-    if (closeIdx >= 0) {
-      remaining = afterOpen.slice(closeIdx + 3);
-      continue;
-    }
-
-    insideFence.value = true;
+    // ── If nothing matched, keep everything ──
+    result += remaining;
     break;
   }
 
   return result;
 }
 
-import { ConversationTurn } from './contextManager';
+import { ConversationTurn, WorkingMemory } from './contextManager';
 
 export interface AgentConfig {
   melaToken: string;
@@ -79,6 +121,9 @@ export interface AgentSession {
 
 export type AgentEvent =
   | { type: 'thinking'; content: string }
+  | { type: 'thinking_start' }
+  | { type: 'thinking_chunk'; content: string }
+  | { type: 'thinking_end' }
   | { type: 'action'; content: string }
   | { type: 'text'; content: string }
   | { type: 'tool_call'; name: string; params: Record<string, unknown> }
@@ -104,15 +149,6 @@ export interface AgentExecutionState {
   discoveredEntrypoints: string[];
   assumptions: string[];
   blockers: string[];
-  repoSummary: string;
-}
-
-export interface WorkingMemory {
-  inspectedFiles: string[];
-  editedFiles: string[];
-  pendingTasks: string[];
-  discoveredIssues: string[];
-  verificationResults: string[];
   repoSummary: string;
 }
 
@@ -161,6 +197,57 @@ function isReadTool(name: string): boolean {
   return name === 'read_file' || name === 'search_files' || name === 'find_files' || name === 'list_dir';
 }
 
+const FILE_CREATION_RE = /create|generate|make|write|build|produce|save|output/i;
+const FILE_EXT_RE = /\.(\w+)\b/;
+
+function isFileCreationTask(task: string): boolean {
+  return FILE_CREATION_RE.test(task) && FILE_EXT_RE.test(task);
+}
+
+function inferFilename(task: string, language: string): string {
+  const extMap: Record<string, string> = {
+    html: 'index.html', css: 'style.css', js: 'script.js', ts: 'script.ts',
+    jsx: 'component.jsx', tsx: 'component.tsx', json: 'data.json',
+    py: 'script.py', rs: 'main.rs', go: 'main.go', java: 'Main.java',
+    c: 'main.c', cpp: 'main.cpp', rb: 'script.rb', php: 'index.php',
+    vue: 'App.vue', svelte: 'App.svelte', md: 'README.md', yaml: 'config.yaml',
+    yml: 'config.yml', toml: 'config.toml', xml: 'config.xml',
+    sql: 'query.sql', sh: 'script.sh', bash: 'script.sh',
+  };
+  const extMatch = task.match(FILE_EXT_RE);
+  if (extMatch) return `index.${extMatch[1]}`;
+  if (extMap[language]) return extMap[language];
+  return 'output.txt';
+}
+
+const FILE_HEADER_RE = /^[\w\-. ]+\.(html?|css|js|ts|jsx|tsx|py|rb|go|rs|java|c|cpp|vue|svelte|php|json|md|yaml|yml|xml|sql|sh|bash)\s*\n/m;
+
+function extractCodeBlock(text: string): { filename: string; language: string; content: string } | null {
+  // Try fenced code blocks first
+  const fenceMatch = text.match(/```(\w*)\n?([\s\S]*?)```/);
+  if (fenceMatch) {
+    const language = fenceMatch[1] || 'txt';
+    const content = fenceMatch[2].trim();
+    if (content) return { filename: inferFilename('', language), language, content };
+  }
+  // Try non-fenced format: filename.ext\n<content>
+  const fileHeader = text.match(FILE_HEADER_RE);
+  if (fileHeader) {
+    const filename = fileHeader[0].trim();
+    const ext = fileHeader[1];
+    const langMap: Record<string, string> = {
+      html: 'html', htm: 'html', css: 'css', js: 'js', ts: 'ts',
+      jsx: 'jsx', tsx: 'tsx', py: 'py', rb: 'rb', go: 'go', rs: 'rs',
+      java: 'java', c: 'c', cpp: 'cpp', vue: 'vue', svelte: 'svelte',
+      php: 'php', json: 'json', md: 'md', yaml: 'yaml', yml: 'yaml',
+      xml: 'xml', sql: 'sql', sh: 'bash', bash: 'bash',
+    };
+    const content = text.slice(fileHeader.index! + fileHeader[0].length).trim();
+    if (content) return { filename, language: langMap[ext] || 'txt', content };
+  }
+  return null;
+}
+
 async function logDebug(enabled: boolean, message: string): Promise<void> {
   if (!enabled) return;
   try {
@@ -170,6 +257,24 @@ async function logDebug(enabled: boolean, message: string): Promise<void> {
   } catch {
     // Debug logging must never crash the agent.
   }
+}
+
+// P5.1: Classify stream errors into user-friendly messages
+function classifyStreamError(err: Error): string {
+  const msg = err.message.toLowerCase();
+  if (msg.includes('fetch failed') || msg.includes('econnrefused') || msg.includes('enotfound'))
+    return 'Network error: Cannot reach the Mela API. Check your internet connection.';
+  if (msg.includes('create-session failed: 500') || msg.includes('http 500'))
+    return 'Server error: The Mela API is experiencing issues. Will retry automatically.';
+  if (msg.includes('401') || msg.includes('403') || msg.includes('unauthorized'))
+    return 'Authentication failed: Your MELA_TOKEN may be invalid or expired. Run `mela-coder --login` to get a fresh token.';
+  if (msg.includes('terminated') || msg.includes('aborted'))
+    return 'Connection terminated: The API stream was interrupted. Will retry automatically.';
+  if (msg.includes('429') || msg.includes('rate'))
+    return 'Rate limited: Too many requests. Please wait a moment.';
+  if (msg.includes('timeout') || msg.includes('etimedout'))
+    return 'Request timed out: The server took too long to respond.';
+  return `Stream error: ${err.message}`;
 }
 
 export function createAgent(config: AgentConfig): AgentSession {
@@ -220,10 +325,18 @@ export function createAgent(config: AgentConfig): AgentSession {
   const projectMemory = ProjectMemory.load();
   const skills = SkillLoader.discoverSkills();
   const systemPrompt = buildSystemPrompt(registry, projectMemory);
-  const context = new ContextManager(systemPrompt);
+  const memory = new MemoryManager();
+  const context = new ContextManager(systemPrompt, memory);
   const client = new MelaClient(config.melaToken);
   let stopped = false;
   let debug = config.debug ?? false;
+
+  // Runtime components
+  const stateMachine = new StateMachine();
+  const orchestrator = new TaskOrchestrator();
+
+  // Load project memory into working memory
+  memory.loadProjectMemory().catch(() => {});
 
   const gate = new PermissionGate({
     allowAll: config.dangerouslyAllowAll,
@@ -232,6 +345,13 @@ export function createAgent(config: AgentConfig): AgentSession {
   setPermissionGate(gate);
 
   async function* run(task: string): AsyncGenerator<AgentEvent> {
+    // P1.2: Always start from clean state (fixes REPL multi-turn crashes)
+    stateMachine.reset();
+    orchestrator.reset();
+
+    // Initialize task plan
+    const plan = orchestrator.createPlan(task);
+    
     // Contextually match and load skills
     const matched = SkillLoader.matchSkills(task, skills);
     if (matched.length > 0) {
@@ -265,26 +385,28 @@ export function createAgent(config: AgentConfig): AgentSession {
     let lastRawResponse = '';
     let consecutiveIdenticalResponses = 0;
 
-    const workingMemory: WorkingMemory = {
-      inspectedFiles: [],
-      editedFiles: [],
-      pendingTasks: [],
-      discoveredIssues: [],
-      verificationResults: [],
-      repoSummary: '',
-    };
+    // P2.3: Circuit breaker for consecutive stream failures
+    let consecutiveStreamFailures = 0;
+    const MAX_STREAM_FAILURES = 3;
+
+    // P2.1: Tool-level loop detection (tracks recent tool call signatures)
+    const recentToolSignatures: string[] = [];
+    const MAX_IDENTICAL_TOOL_CALLS = 3;
+
+    // Working memory is managed by context manager
+    let workingMemory = context.getWorkingMemory();
 
     const executionState: AgentExecutionState = {
       currentGoal: task,
       completedSteps: [],
       failedSteps: [],
-      inspectedFiles: [],
-      editedFiles: [],
+      inspectedFiles: workingMemory.inspectedFiles,
+      editedFiles: workingMemory.editedFiles,
       discoveredStack: [],
       discoveredEntrypoints: [],
       assumptions: [],
       blockers: [],
-      repoSummary: '',
+      repoSummary: workingMemory.repoSummary,
     };
 
     let isResumed = false;
@@ -307,6 +429,9 @@ export function createAgent(config: AgentConfig): AgentSession {
       }
     }
 
+    // Transition to planning state
+    stateMachine.transition(AgentState.PLANNING, 'start_task');
+
     while (iterations < MAX && !stopped) {
       iterations++;
       yield { type: 'iteration', count: iterations, max: MAX };
@@ -319,6 +444,16 @@ export function createAgent(config: AgentConfig): AgentSession {
         }
 
         const history = context.getHistoryForRequest();
+
+        // Context window protection: trim oldest turns if context exceeds ~50K chars
+        const MAX_CONTEXT_CHARS = 50000;
+        let totalChars = history.reduce((sum, t) => sum + t.content.length, 0);
+        while (totalChars > MAX_CONTEXT_CHARS && history.length > 4) {
+          // Keep index 0 (system prompt), drop index 1 (oldest turn)
+          totalChars -= history[1].content.length;
+          history.splice(1, 1);
+        }
+
         const prompt = history.map(t => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content}`).join('\n\n');
 
         const systemPromptTokens = context.estimateTokens(systemPrompt.full);
@@ -330,44 +465,70 @@ export function createAgent(config: AgentConfig): AgentSession {
         let raw = '';
         const toolNames = new Set(registry.all().map(t => t.name));
         const fenceState = { value: false };
-        let thinkingBuf = '';
+        const fileContentState = { value: false };
+        let thinkingStarted = false;
         try {
           for await (const chunk of client.generateStream(prompt, {
-            reasoning: config.reasoning ?? false,
+            reasoning: config.reasoning ?? true,
             search: config.search ?? false,
           })) {
             if (chunk.reasoning) {
-              thinkingBuf += chunk.reasoning;
+              if (!thinkingStarted) {
+                yield { type: 'thinking_start' };
+                thinkingStarted = true;
+              }
+              yield { type: 'thinking_chunk', content: chunk.reasoning };
             }
             if (chunk.text) {
-              if (thinkingBuf) {
-                yield { type: 'thinking', content: thinkingBuf };
-                thinkingBuf = '';
+              if (thinkingStarted) {
+                yield { type: 'thinking_end' };
+                thinkingStarted = false;
               }
               raw += chunk.text;
-              const displayText = filterToolFence(chunk.text, toolNames, fenceState);
+              // Stream size limit: prevent OOM from massive responses
+              const MAX_RAW_CHARS = 20000;
+              if (raw.length > MAX_RAW_CHARS) {
+                raw = raw.slice(-MAX_RAW_CHARS);
+              }
+              const displayText = filterToolAndFileFence(chunk.text, toolNames, fenceState, fileContentState);
               if (displayText) {
                 yield { type: 'stream_chunk', content: displayText };
               }
             }
             if (chunk.status) {
-              if (thinkingBuf) {
-                yield { type: 'thinking', content: thinkingBuf };
-                thinkingBuf = '';
+              if (thinkingStarted) {
+                yield { type: 'thinking_end' };
+                thinkingStarted = false;
               }
               yield { type: 'status', content: chunk.status };
             }
             if (chunk.done) break;
           }
         } catch (streamErr: any) {
-          if (thinkingBuf) yield { type: 'thinking', content: thinkingBuf };
+          if (thinkingStarted) {
+            yield { type: 'thinking_end' };
+            thinkingStarted = false;
+          }
           yield { type: 'stream_end' };
           if (!raw) {
-            throw streamErr;
+            // P2.3: Track consecutive stream failures
+            consecutiveStreamFailures++;
+            const friendlyMsg = classifyStreamError(streamErr);
+            yield { type: 'error', message: friendlyMsg };
+            if (consecutiveStreamFailures >= MAX_STREAM_FAILURES) {
+              yield { type: 'error', message: `Connection failed ${MAX_STREAM_FAILURES} times consecutively. Please check your network and API token, then try again.` };
+              return;
+            }
+            continue;
           }
           await logDebug(debug, `Stream error after ${raw.length} chars: ${streamErr.message}`);
         }
-        if (thinkingBuf) yield { type: 'thinking', content: thinkingBuf };
+        // P2.3: Reset circuit breaker on successful stream
+        consecutiveStreamFailures = 0;
+        if (thinkingStarted) {
+          yield { type: 'thinking_end' };
+          thinkingStarted = false;
+        }
         yield { type: 'stream_end' };
 
         const responseTokens = context.estimateTokens(raw);
@@ -392,7 +553,19 @@ export function createAgent(config: AgentConfig): AgentSession {
         }
         lastRawResponse = raw;
 
-        const parsed = parseMelaResponse(raw);
+        // Detect raw file content (filename.ext followed by content) and convert to tool call
+        // This handles cases where the model outputs: "one.html\n<!DOCTYPE html>..." instead of proper format
+        if (isFileCreationTask(task)) {
+          const rawFileMatch = raw.match(/^\s*([\w\-./]+\.(?:html?|css|js|ts|jsx|tsx|py|rb|go|rs|java|c|cpp|vue|svelte|php|json|md|yaml|yml|xml|sql|sh))\s*\n([\s\S]*)/i);
+          if (rawFileMatch) {
+            const filename = rawFileMatch[1];
+            const content = rawFileMatch[2].trim();
+            // Wrap as proper tool call format so parser can handle it
+            raw = '```write_file\n' + filename + '\n' + content + '\n```';
+          }
+        }
+
+        const parsed = parseMelaResponse(raw, toolNames);
 
         if (parsed.isError) {
           context.addTurn({ role: 'assistant', content: raw });
@@ -400,41 +573,68 @@ export function createAgent(config: AgentConfig): AgentSession {
           return;
         }
 
-          if (parsed.text && !parsed.toolCall) {
-            context.addTurn({ role: 'assistant', content: raw });
+        if (parsed.text && !parsed.toolCall) {
+          context.addTurn({ role: 'assistant', content: raw });
           hasProducedOutput = true;
 
-            if (parsed.isDone) {
-              const displayText = parsed.text.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '').trim();
-              yield { type: 'text', content: displayText || parsed.text };
-              yield* handleDone();
-              return;
-            }
-
-            // After a tool execution, text without [done] means the model
-            // should keep going. Let the model correct itself.
-            if (afterToolExecution) {
-              yield { type: 'text', content: parsed.text };
-              afterToolExecution = false;
-              continue;
-            }
-
-            yield { type: 'text', content: parsed.text };
+          if (parsed.isDone) {
+            const displayText = parsed.text.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '').trim();
+            yield { type: 'text', content: displayText || parsed.text };
             yield* handleDone();
             return;
           }
+
+          // After a tool execution, text without [done] means the model
+          // should keep going. Let the model correct itself.
+          if (afterToolExecution) {
+            yield { type: 'text', content: parsed.text };
+            afterToolExecution = false;
+            continue;
+          }
+
+          // Fallback: if model output code as text instead of calling write_file
+          const codeBlock = extractCodeBlock(parsed.text);
+          if (codeBlock && isFileCreationTask(task)) {
+            yield { type: 'text', content: `→ Auto-saving ${codeBlock.filename} (${codeBlock.content.length} chars)` };
+            const result = await executeTool({
+              name: 'write_file',
+              params: { path: codeBlock.filename, content: codeBlock.content }
+            }, registry);
+            yield { type: 'tool_result', name: 'write_file', success: result.success, output: result.output || result.error || '' };
+            if (result.success) {
+              workingMemory.editedFiles.push(codeBlock.filename);
+            }
+            yield* handleDone();
+            return;
+          }
+
+          yield { type: 'text', content: parsed.text };
+          yield* handleDone();
+          return;
+        }
 
         if (parsed.isDone) {
           context.addTurn({ role: 'assistant', content: raw });
           yield* handleDone();
           return;
-        }
+}
 
         if (parsed.toolCalls && parsed.toolCalls.length > 0) {
           context.addTurn({ role: 'assistant', content: raw });
 
+          // Transition to executing state now that we have tool calls (only once per turn)
+          if (stateMachine.getCurrent() !== AgentState.EXECUTING) {
+            stateMachine.transition(AgentState.EXECUTING, 'tool_calls_received');
+          }
+
           for (const toolCall of parsed.toolCalls) {
             yield { type: 'tool_call', name: toolCall.name, params: toolCall.params };
+
+            // P2.1: Track tool call signatures for loop detection
+            const toolSig = `${toolCall.name}:${JSON.stringify(toolCall.params)}`;
+            recentToolSignatures.push(toolSig);
+            // Keep only last 10 signatures
+            if (recentToolSignatures.length > 10) recentToolSignatures.shift();
 
             if (toolCall.name === 'done') {
               const summary = toolCall.params.summary;
@@ -475,11 +675,39 @@ export function createAgent(config: AgentConfig): AgentSession {
               }
             }
 
-            yield { type: 'step', content: result.success ? `✓ ${toolCall.name}` : `✗ ${toolCall.name}` };
             yield { type: 'tool_result', name: toolCall.name, success: result.success, output: result.output || result.error || '' };
 
             hasProducedOutput = true;
             afterToolExecution = true;
+
+            // P2.2: Special recovery for permission denials — don't let model retry
+            if (!result.success && result.error?.includes('[BLOCKED]')) {
+              context.addTurn({
+                role: 'user',
+                content: `[PERMISSION DENIED] The user explicitly denied permission for "${toolCall.name}". Do NOT retry this action. Inform the user that the action was blocked and suggest an alternative, then end with [done].`
+              });
+              break; // Skip remaining tool calls in this batch
+            }
+
+            // P2.1: Recovery for unknown tool calls — correct the model
+            if (!result.success && result.error?.includes('Unknown tool')) {
+              context.addTurn({
+                role: 'user',
+                content: `[TOOL ERROR] "${toolCall.name}" is not a valid tool. Do NOT call it again. Use only these tools: ${Array.from(toolNames).slice(0, 15).join(', ')}... Call a valid tool or provide a text response with [done].`
+              });
+              break;
+            }
+
+            // P2.1: Detect tool-level loops (same tool+params called 3+ times)
+            const lastN = recentToolSignatures.slice(-MAX_IDENTICAL_TOOL_CALLS);
+            if (lastN.length >= MAX_IDENTICAL_TOOL_CALLS && lastN.every(s => s === lastN[0])) {
+              context.addTurn({
+                role: 'user',
+                content: `[LOOP DETECTED] You have called "${toolCall.name}" with identical parameters ${MAX_IDENTICAL_TOOL_CALLS} times in a row. This is stuck in a loop. Try a completely different approach or inform the user of the issue, then end with [done].`
+              });
+              recentToolSignatures.length = 0; // Reset to avoid re-triggering
+              break;
+            }
 
             // Track in working memory
             const toolName = toolCall.name;
@@ -490,7 +718,8 @@ export function createAgent(config: AgentConfig): AgentSession {
               }
             }
 
-            if (isEditTool(toolName) && result.success) {
+            // Skip verification for delete operations - the file is gone and lint/test may be irrelevant
+            if (isEditTool(toolName) && result.success && toolName !== 'delete_file') {
               const pathStr = String(toolCall.params.path ?? toolCall.params.file_path ?? '');
               if (pathStr && !workingMemory.editedFiles.includes(pathStr)) {
                 workingMemory.editedFiles.push(pathStr);
@@ -499,14 +728,27 @@ export function createAgent(config: AgentConfig): AgentSession {
               // Hardened Verification Chain
               if (!config.skipVerify) {
                 yield { type: 'status', content: 'Running verification chain...' };
-                const verifyRes = await VerificationChain.run(false);
-                if (!verifyRes.passed) {
-                  const errorContext = VerificationChain.formatFailuresForAgent(verifyRes.results);
-                  context.addTurn({ role: 'user', content: errorContext });
-                  yield { type: 'step', content: `✗ verification failed` };
+                const verifyRes = await EnhancedVerificationChain.run(false, false, true);
+
+                if (!verifyRes.passed && verifyRes.evaluation) {
+                  const evaluation = verifyRes.evaluation;
+
+                  if (evaluation.class === ResultClass.RETRY) {
+                    const errorContext = VerificationChain.formatFailuresForAgent(verifyRes.results);
+                    context.addTurn({ role: 'user', content: errorContext });
+                    yield { type: 'step', content: `✗ verification failed - ${evaluation.reason}` };
+                  } else if (evaluation.class === ResultClass.FAIL) {
+                    yield { type: 'step', content: `✗ ${evaluation.reason}` };
+                  }
                 } else if (verifyRes.badge) {
                   yield { type: 'step', content: verifyRes.badge };
                 }
+
+                // Update state based on result
+                stateMachine.transition(
+                  verifyRes.passed ? AgentState.SUCCESS : AgentState.VERIFYING,
+                  verifyRes.passed ? 'verification_passed' : 'verification_failed'
+                );
               }
             }
 
@@ -525,6 +767,8 @@ export function createAgent(config: AgentConfig): AgentSession {
               }
             }
 
+            // Sync working memory back to context
+            context.updateWorkingMemory(workingMemory);
             context.addTurn({ role: 'user', content: formatToolResult(toolCall.name, result) });
           }
           continue;
@@ -549,7 +793,7 @@ export function createAgent(config: AgentConfig): AgentSession {
   return {
     run,
     stop(): void { stopped = true; },
-    reset(): void { context.reset(); },
+    reset(): void { context.reset(); stateMachine.reset(); orchestrator.reset(); },
     getHistoryStats(): { turns: number; estimatedTokens: number } {
       return context.getHistoryStats();
     },

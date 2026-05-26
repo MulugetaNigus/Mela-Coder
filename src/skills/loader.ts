@@ -7,6 +7,11 @@ export interface Skill {
   triggers: RegExp;  // Pattern to match against the task prompt
 }
 
+const CUSTOM_SKILL_TRIGGERS: Record<string, RegExp> = {
+  // Trigger on coding/task patterns - model decides if planning is needed
+  'create-plan': /(?:implement|build|create|add|refactor|update|modify|write|generate|make|feature|component|function|api|auth|theme|css|html|page|cli)\b/i,
+};
+
 export class SkillLoader {
   private static readonly BUILTIN_SKILLS_DIR = path.join(__dirname, '../../src/skills');
 
@@ -34,12 +39,8 @@ export class SkillLoader {
           const filePath = path.join(skillsDir, file);
           const content = fs.readFileSync(filePath, 'utf8');
           
-          // Define triggers for specific skills.
-          // By default, build a simple word regex from name, or use specialized list.
-          let triggers = new RegExp(`\\b(${name})\\b`, 'i');
-          if (name === 'frontend-design') {
-            triggers = /\b(html|css|jsx|tsx|react|next\.?js|vite|frontend|landing\s*page|dashboard|ui|ux|component|layout|design|styled|tailwind|responsive|animation|hero\s*section|navbar|sidebar|modal|card|button|form|theme|dark\s*mode|light\s*mode|glassmorphism|web\s*page|web\s*app|website|single[- ]page)\b/i;
-          }
+          // Use custom triggers for specific skills, or build from name
+          let triggers = CUSTOM_SKILL_TRIGGERS[name] ?? new RegExp(`\\b(${name})\\b`, 'i');
 
           skills.push({
             name,
