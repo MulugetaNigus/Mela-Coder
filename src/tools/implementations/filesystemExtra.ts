@@ -2,6 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ToolDefinition, ToolResult } from '../registry';
 import { globToRegExp, humanSize, renderDiff, resolveWorkspacePath, walkFiles } from './toolUtils';
+import { promptDiff } from '../../ui/diff';
 
 export const editFileTool: ToolDefinition = {
   name: 'edit_file',
@@ -21,6 +22,13 @@ export const editFileTool: ToolDefinition = {
       if (count === 0) return { success: false, output: '', error: 'old_str was not found in file' };
       if (count > 1 && params.replace_all !== true) return { success: false, output: '', error: `old_str matched ${count} times. Set replace_all=true or provide a more specific old_str.` };
       const updated = params.replace_all === true ? content.split(params.old_str).join(params.new_str) : content.replace(params.old_str, params.new_str);
+      const decision = await promptDiff(content, updated, String(params.path));
+      if (decision === 'skip') {
+        return { success: false, output: '', error: `[SKIPPED] User declined applying the changes to ${params.path}` };
+      }
+      if (decision === 'abort') {
+        return { success: false, output: '', error: `[ABORTED] User aborted the modification to ${params.path}` };
+      }
       await fs.writeFile(`${filePath}.tmp`, updated, 'utf8');
       await fs.rename(`${filePath}.tmp`, filePath);
       return { success: true, output: `Edited ${params.path}: replaced ${params.replace_all === true ? count : 1} occurrence(s).\n${renderDiff(params.old_str, params.new_str)}` };

@@ -122,10 +122,6 @@ export interface AgentSession {
 }
 
 export type AgentEvent =
-  | { type: 'thinking'; content: string }
-  | { type: 'thinking_start' }
-  | { type: 'thinking_chunk'; content: string }
-  | { type: 'thinking_end' }
   | { type: 'action'; content: string }
   | { type: 'text'; content: string }
   | { type: 'tool_call'; name: string; params: Record<string, unknown> }
@@ -162,8 +158,22 @@ function isListWorkspaceRequest(task: string): boolean {
   return /\b(list|show)\b/i.test(task) && /\b(files?|folders?|directories|tree|workspace|project)\b/i.test(task);
 }
 
-function isCapabilityRequest(task: string): boolean {
-  return /\b(what can you do|capabilit(?:y|ies)|list your (?:all )?capabilit(?:y|ies)|available tools|what tools|your tools)\b/i.test(task);
+function isExecutionRequest(task: string): boolean {
+  if (isListWorkspaceRequest(task) || shouldForceWorkspaceExploration(task)) return false;
+  if (/\b(?:explain|describe|summarize|what is|how does|why|help|usage|example|simulate|demo)\b/i.test(task)) return false;
+  return /\b(?:fix|change|remove|add|update|modify|edit|implement|build|create|write|generate|make|refactor|debug|repair|install|run|test|verify)\b/i.test(task);
+}
+
+function isIntentOnlyResponse(text: string): boolean {
+  return /\b(?:I will|I'll|I am going to|I'm going to|I need to|I should|Let me|First,? I|Next,? I)\b/i.test(text);
+}
+
+function isModificationRequest(task: string): boolean {
+  return /\b(?:fix|change|remove|add|update|modify|edit|implement|build|create|write|generate|make|refactor|debug|repair)\b/i.test(task);
+}
+
+function isPlanApproval(task: string): boolean {
+  return /^(?:\/execute|go ahead|proceed|continue|yes|y|approved?|do it|start|run it)$/i.test(task.trim());
 }
 
 async function validateFileToolCall(name: string, params: Record<string, unknown>): Promise<string | null> {
@@ -305,6 +315,12 @@ function classifyStreamError(err: Error): string {
 
 export function createAgent(config: AgentConfig): AgentSession {
   const registry: ToolRegistry = createDefaultRegistry();
+  if (config.melaToken && !process.env.MELA_TOKEN) {
+    process.env.MELA_TOKEN = config.melaToken;
+  }
+  if (config.melaRefreshToken && !process.env.MELA_REFRESH_TOKEN) {
+    process.env.MELA_REFRESH_TOKEN = config.melaRefreshToken;
+  }
 
   // Auto-discover stack and initialize memory if none exists
   if (!ProjectMemory.findPath()) {
@@ -386,9 +402,6 @@ export function createAgent(config: AgentConfig): AgentSession {
     if (matched.length > 0) {
       const updatedSystemPrompt = buildSystemPrompt(registry, projectMemory, matched.map(s => s.content));
       context.updateSystemPrompt(updatedSystemPrompt);
-      for (const s of matched) {
-        yield { type: 'step', content: `✓ skill:${s.name} loaded` };
-      }
     }
 
     async function* yieldCacheSummary(): AsyncGenerator<AgentEvent> {
@@ -413,6 +426,7 @@ export function createAgent(config: AgentConfig): AgentSession {
     stopped = false;
     let lastRawResponse = '';
     let consecutiveIdenticalResponses = 0;
+    let consecutiveTextOnlyExecutionResponses = 0;
 
     // P2.3: Circuit breaker for consecutive stream failures
     let consecutiveStreamFailures = 0;
@@ -421,7 +435,7 @@ export function createAgent(config: AgentConfig): AgentSession {
     // P2.1: Tool-level loop detection (tracks recent tool call signatures)
     const recentToolSignatures: string[] = [];
     const MAX_IDENTICAL_TOOL_CALLS = 3;
-    let directAnswerRetry = false;
+    const failedToolSignatures = new Set<string>();
 
     // Working memory is managed by context manager
     let workingMemory = context.getWorkingMemory();
@@ -456,6 +470,19 @@ export function createAgent(config: AgentConfig): AgentSession {
       const workspaceNudge = getWorkspaceNudge(task);
       if (workspaceNudge) {
         context.addTurn({ role: 'user', content: workspaceNudge });
+      }
+      if (isPlanApproval(task)) {
+        context.addTurn({
+          role: 'user',
+          content: [
+            '[APPROVED EXECUTION]',
+            'Continue the previously approved plan from the conversation history.',
+            'Do not ask what to do next while planned work remains.',
+            'For substantial multi-step implementation work, first consider dispatch_subtasks/spawn_agents with narrow specialist tasks for scaffold/setup, implementation, and verification/review.',
+            'Execute exactly one next tool call now, then continue the tool-result loop autonomously until complete, blocked, or verification fails.',
+            'If a previous command failed, diagnose it and choose a different command or implementation path. Never retry the exact same failed tool call.'
+          ].join(' ')
+        });
       }
     }
 
@@ -496,24 +523,12 @@ export function createAgent(config: AgentConfig): AgentSession {
         const toolNames = new Set(registry.all().map(t => t.name));
         const fenceState = { value: false };
         const fileContentState = { value: false };
-        let thinkingStarted = false;
         try {
           for await (const chunk of client.generateStream(prompt, {
-            reasoning: config.reasoning ?? true,
+            reasoning: false,
             search: config.search ?? false,
           })) {
-            if (chunk.reasoning) {
-              if (!thinkingStarted) {
-                yield { type: 'thinking_start' };
-                thinkingStarted = true;
-              }
-              yield { type: 'thinking_chunk', content: chunk.reasoning };
-            }
             if (chunk.text) {
-              if (thinkingStarted) {
-                yield { type: 'thinking_end' };
-                thinkingStarted = false;
-              }
               raw += chunk.text;
               // Stream size limit: prevent OOM from massive responses
               const MAX_RAW_CHARS = 20000;
@@ -521,24 +536,16 @@ export function createAgent(config: AgentConfig): AgentSession {
                 raw = raw.slice(-MAX_RAW_CHARS);
               }
               const displayText = filterToolAndFileFence(chunk.text, toolNames, fenceState, fileContentState);
-              if (displayText) {
+              if (displayText && !isExecutionRequest(task)) {
                 yield { type: 'stream_chunk', content: displayText };
               }
             }
             if (chunk.status) {
-              if (thinkingStarted) {
-                yield { type: 'thinking_end' };
-                thinkingStarted = false;
-              }
               yield { type: 'status', content: chunk.status };
             }
             if (chunk.done) break;
           }
         } catch (streamErr: any) {
-          if (thinkingStarted) {
-            yield { type: 'thinking_end' };
-            thinkingStarted = false;
-          }
           yield { type: 'stream_end' };
           if (!raw) {
             // P2.3: Track consecutive stream failures
@@ -555,10 +562,6 @@ export function createAgent(config: AgentConfig): AgentSession {
         }
         // P2.3: Reset circuit breaker on successful stream
         consecutiveStreamFailures = 0;
-        if (thinkingStarted) {
-          yield { type: 'thinking_end' };
-          thinkingStarted = false;
-        }
         yield { type: 'stream_end' };
 
         const responseTokens = context.estimateTokens(raw);
@@ -608,6 +611,15 @@ export function createAgent(config: AgentConfig): AgentSession {
           hasProducedOutput = true;
 
           if (parsed.isDone) {
+            if (isModificationRequest(task) && workingMemory.editedFiles.length === 0 && consecutiveTextOnlyExecutionResponses < 3) {
+              consecutiveTextOnlyExecutionResponses++;
+              context.addTurn({
+                role: 'user',
+                content: '[EXECUTION REQUIRED] You signaled done before making any file change for an implementation task. Continue now with the next appropriate search/read/edit tool call.'
+              });
+              lastRawResponse = '';
+              continue;
+            }
             const displayText = parsed.text.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '').trim();
             yield { type: 'text', content: displayText || parsed.text };
             yield* handleDone();
@@ -615,10 +627,24 @@ export function createAgent(config: AgentConfig): AgentSession {
           }
 
           // After a tool execution, text without [done] means the model
-          // should keep going. Let the model correct itself.
+          // should keep going. Convert intention/explanation into an internal retry.
           if (afterToolExecution) {
-            yield { type: 'text', content: parsed.text };
             afterToolExecution = false;
+            if (isExecutionRequest(task) && consecutiveTextOnlyExecutionResponses < 3) {
+              consecutiveTextOnlyExecutionResponses++;
+              context.addTurn({
+                role: 'user',
+                content: [
+                  '[EXECUTION REQUIRED]',
+                  'Your last response after a tool result was text-only.',
+                  'Do not describe the next action to the user.',
+                  'Call the next appropriate tool now: search/read/edit/execute/verify.',
+                  isIntentOnlyResponse(parsed.text) ? 'You described an intention; perform that action now.' : 'Continue autonomously until verified or genuinely blocked.'
+                ].join(' ')
+              });
+              lastRawResponse = '';
+              continue;
+            }
             continue;
           }
 
@@ -638,6 +664,22 @@ export function createAgent(config: AgentConfig): AgentSession {
             return;
           }
 
+          if (isExecutionRequest(task) && consecutiveTextOnlyExecutionResponses < 3) {
+            consecutiveTextOnlyExecutionResponses++;
+            context.addTurn({
+              role: 'user',
+              content: [
+                '[EXECUTION REQUIRED]',
+                'The user requested an implementation task, but your previous response was text-only.',
+                'Do not explain intentions or ask to proceed.',
+                'Call the next appropriate tool now: search/read/edit/execute/verify.',
+                isIntentOnlyResponse(parsed.text) ? 'Your last response described an intention; perform that action now.' : 'Continue autonomously until verified or genuinely blocked.'
+              ].join(' ')
+            });
+            lastRawResponse = '';
+            continue;
+          }
+
           yield { type: 'text', content: parsed.text };
           yield* handleDone();
           return;
@@ -645,31 +687,30 @@ export function createAgent(config: AgentConfig): AgentSession {
 
         if (parsed.isDone) {
           context.addTurn({ role: 'assistant', content: raw });
+          if (isModificationRequest(task) && workingMemory.editedFiles.length === 0 && consecutiveTextOnlyExecutionResponses < 3) {
+            consecutiveTextOnlyExecutionResponses++;
+            context.addTurn({
+              role: 'user',
+              content: '[EXECUTION REQUIRED] You signaled done before making any file change for an implementation task. Continue now with the next appropriate search/read/edit tool call.'
+            });
+            lastRawResponse = '';
+            continue;
+          }
           yield* handleDone();
           return;
         }
 
         if (parsed.toolCalls && parsed.toolCalls.length > 0) {
-          if (isCapabilityRequest(task)) {
+          if (parsed.text && parsed.text.trim()) {
             context.addTurn({ role: 'assistant', content: raw });
-            if (parsed.text && parsed.text.trim()) {
+            if (!isExecutionRequest(task)) {
               yield { type: 'text', content: parsed.text };
               yield* handleDone();
               return;
             }
-            if (!directAnswerRetry) {
-              directAnswerRetry = true;
-              context.addTurn({
-                role: 'user',
-                content: 'Answer the capability/help question in plain text only. Do not call tools for this request.'
-              });
-              continue;
-            }
-            yield* handleDone();
-            return;
+          } else {
+            context.addTurn({ role: 'assistant', content: raw });
           }
-
-          context.addTurn({ role: 'assistant', content: raw });
 
           // Transition to executing state now that we have tool calls (only once per turn)
           if (stateMachine.getCurrent() !== AgentState.EXECUTING) {
@@ -693,12 +734,30 @@ export function createAgent(config: AgentConfig): AgentSession {
             if (recentToolSignatures.length > 10) recentToolSignatures.shift();
 
             if (toolCall.name === 'done') {
+              if (isModificationRequest(task) && workingMemory.editedFiles.length === 0 && consecutiveTextOnlyExecutionResponses < 3) {
+                consecutiveTextOnlyExecutionResponses++;
+                context.addTurn({
+                  role: 'user',
+                  content: '[EXECUTION REQUIRED] You called done before making any file change for an implementation task. Continue now with the next appropriate search/read/edit tool call.'
+                });
+                lastRawResponse = '';
+                break;
+              }
               const summary = toolCall.params.summary;
               if (typeof summary === 'string' && summary.trim()) {
                 yield { type: 'text', content: summary };
               }
               yield* handleDone();
               return;
+            }
+
+            if (failedToolSignatures.has(toolSig)) {
+              context.addTurn({
+                role: 'user',
+                content: `[TOOL RETRY BLOCKED] The exact call ${toolSig} already failed. Do not retry it. Continue the approved plan with a different command, a different tool, or a concise blocker if no safe alternative exists.`
+              });
+              yield { type: 'step', content: `Blocked duplicate failed tool retry: ${toolCall.name}` };
+              break;
             }
 
             const result = await executeTool(toolCall, registry);
@@ -810,6 +869,7 @@ export function createAgent(config: AgentConfig): AgentSession {
             }
 
             if (!result.success) {
+              failedToolSignatures.add(toolSig);
               const issue = `${toolName}: ${(result.error ?? result.output).slice(0, 80)}`;
               if (!workingMemory.discoveredIssues.includes(issue)) {
                 workingMemory.discoveredIssues.push(issue);

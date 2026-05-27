@@ -6,7 +6,7 @@ export interface VerificationStepResult {
   passed: boolean;
   durationMs: number;
   output: string;
-  category?: 'syntax' | 'type' | 'lint' | 'test' | 'runtime' | 'build';
+  category?: 'syntax' | 'type' | 'lint' | 'test' | 'runtime' | 'build' | 'diff';
 }
 
 export enum ResultClass {
@@ -99,6 +99,8 @@ export class VerificationChain {
       steps.push({ name: 'typecheck', command: 'go build', category: 'build' });
       steps.push({ name: 'test', command: 'go test ./...', category: 'test' });
     }
+
+    steps.push({ name: 'diff-check', command: 'git diff --check', category: 'diff' });
 
     return steps;
   }

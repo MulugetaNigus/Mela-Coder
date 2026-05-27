@@ -1,18 +1,19 @@
 # Skill: Create Plan
 
 ## When to Use
-- Use BEFORE implementing any non-trivial coding task (3+ steps, multiple files)
-- Use for building features, refactoring, architectural changes
+- Use only when the user explicitly asks for a plan, design, architecture review, risk analysis, or says to think before editing
+- Use for plan-only requests about features, refactoring, architectural changes
 - **DO NOT use for**: greetings, simple questions, general conversation, quick answers
+- **DO NOT use for**: ordinary implementation requests such as "fix", "add", "update", "remove", "change", or "build" unless the user asks for a plan first
 - Skip this skill if the task is clearly conversational or requires only brief response
 
-In Plan Mode, **no files are written, no commands are executed.** You think. You design. You document.
+In explicit Plan Mode, **no files are written, no commands are executed.** You think. You design. You document. Normal coding tasks should not enter this skill.
  
 ---
  
 ## WHAT PLAN MODE IS
  
-Plan Mode is a pure reasoning and design phase. You behave as a senior staff engineer doing
+Explicit Plan Mode is a pure reasoning and design phase. You behave as a senior staff engineer doing
 an architectural review and implementation design before a single line of code is touched.
 The output is a structured, unambiguous implementation plan that any competent engineer —
 or the agent itself in the next session — can execute exactly as written.
@@ -385,13 +386,14 @@ Tasks  : <N> items
 Est.   : ~<X> hours of implementation
 Unknowns: <N open questions / "None">
  
-To execute: reply with /execute or say "go ahead"
+To execute: reply with /execute, "go ahead", or "proceed"
 To modify : reply with your changes and I will revise the plan
 ```
  
 Do not begin implementation until the user explicitly approves.
-Once approved, switch to normal agent mode and execute the plan task by task,
-checking off each item as it is completed and verified.
+Once approved, switch to normal agent mode and execute the plan task by task until the work is complete, blocked, or verification proves failure.
+Do not ask for "proceed" again between phases or after ordinary successful tool calls.
+Do not abandon the approved plan and ask "what task should I work on?" while any planned work remains.
  
 ---
  

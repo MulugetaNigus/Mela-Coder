@@ -5,7 +5,7 @@ import { writeFileTool } from '../tools/implementations/writeFile';
 import { executeBashTool } from '../tools/implementations/executeBash';
 import { listDirTool } from '../tools/implementations/listDir';
 import { searchFilesTool } from '../tools/implementations/searchFiles';
-import { findFilesTool, fileInfoTool } from '../tools/implementations/filesystemExtra';
+import { editFileTool, findFilesTool, fileInfoTool, makeDirTool } from '../tools/implementations/filesystemExtra';
 import { webSearchTool, fetchUrlTool } from '../tools/implementations/webTools';
 import { gitDiffTool, gitStatusTool } from '../tools/implementations/gitTools';
 import { showDiffTool } from '../tools/implementations/uxTools';
@@ -13,11 +13,15 @@ import { findSymbolTool, getReferencesTool } from '../tools/implementations/code
 import { executeLongRunningTool, checkJobTool, readOutputTool } from '../tools/implementations/jobs';
 import { globTool } from '../tools/implementations/globTool';
 import { setOutputTool } from '../tools/implementations/setOutput';
+import { strReplaceTool } from '../tools/implementations/strReplace';
 
 function getTool(name: string): ToolDefinition | undefined {
   const toolMap: Record<string, ToolDefinition> = {
     'read_file': readFileTool,
     'write_file': writeFileTool,
+    'edit_file': editFileTool,
+    'str_replace': strReplaceTool,
+    'make_dir': makeDirTool,
     'execute_bash': executeBashTool,
     'list_dir': listDirTool,
     'search_files': searchFilesTool,

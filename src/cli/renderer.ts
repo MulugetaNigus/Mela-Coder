@@ -220,9 +220,6 @@ export class Renderer {
   private toolCallMarker = '';
   private toolColor: any = null;
   private insideMarkdownCodeBlock = false;
-  private thinkingLineLength = 0;
-  private thinkingLinesPrinted = 0;
-  private suppressThinkingOutput = false;
   private insideThoughtBlock = false;
   private pendingFile: string | null = null;
   private spinnerCustomLabel: string | null = null;
@@ -301,6 +298,7 @@ export class Renderer {
     process.stdout.write('\n');
     const renderFrame = () => {
       const label = 'Working...';
+      const margin = '  ';
       const waveHead = label.length - 1 - (this.spinnerFrame % (label.length + 3));
       const rendered = [...label].map((char, index) => {
         if (index === waveHead) return `\x1b[1;97m${char}\x1b[0m`;
@@ -309,12 +307,12 @@ export class Renderer {
         return `\x1b[1;2m${char}\x1b[0m`;
       }).join('');
       this.spinnerFrame++;
-      process.stdout.write(`\r\x1b[K${rendered}`);
+      process.stdout.write(`\r\x1b[K${margin}${rendered}`);
     };
     renderFrame();
     this.spinnerTimer = setInterval(() => {
       renderFrame();
-    }, 420);
+    }, 110);
   }
 
   public stopSpinner(): void {
@@ -356,81 +354,6 @@ export class Renderer {
   async render(event: AgentEvent): Promise<void> {
     const chalk = await getChalk();
     switch (event.type) {
-      case 'thinking_start': {
-        this.stopSpinner();
-        this.modelResponded = true;
-        this.thinkingLineLength = 0;
-        if (this.thinkingLinesPrinted >= 5) {
-          this.suppressThinkingOutput = true;
-          break;
-        }
-        this.suppressThinkingOutput = false;
-        process.stdout.write(`\n  ${chalk.dim('Thinking...')}\n  ${chalk.dim('│')} `);
-        break;
-      }
-      case 'thinking_chunk': {
-        if (this.suppressThinkingOutput) break;
-        const text = event.content;
-        const termWidth = process.stdout.columns || 80;
-        const maxLen = Math.max(termWidth - 8, 40);
-
-        for (let i = 0; i < text.length; i++) {
-          const char = text[i];
-          if (char === '\n') {
-            process.stdout.write(`\n  ${chalk.dim('│')} `);
-            this.thinkingLineLength = 0;
-          } else {
-            if (this.thinkingLineLength >= maxLen) {
-              process.stdout.write(`\n  ${chalk.dim('│')} `);
-              this.thinkingLineLength = 0;
-            }
-            if (this.thinkingLineLength === 0) {
-              this.thinkingLinesPrinted++;
-              if (this.thinkingLinesPrinted > 5) break;
-            }
-            process.stdout.write(chalk.gray(char));
-            this.thinkingLineLength++;
-          }
-        }
-        break;
-      }
-      case 'thinking_end': {
-        if (this.suppressThinkingOutput) {
-          this.suppressThinkingOutput = false;
-          break;
-        }
-        process.stdout.write('\n\n');
-        break;
-      }
-      case 'thinking': {
-        this.stopSpinner();
-        this.modelResponded = true;
-        const content = event.content.trim();
-        if (!content) break;
-        if (this.thinkingLinesPrinted >= 5) break;
-
-        const termWidth = process.stdout.columns || 80;
-        const contentWidth = termWidth - 8; // 2 indent + 3 gutter + 3 padding
-        const gutter = chalk.dim('│');
-
-        // Header line
-        process.stdout.write(`  ${chalk.blue('Thinking...')}\n`);
-
-        // Content lines with left gutter
-        const lines = content.split('\n');
-        for (const line of lines) {
-          if (shouldSuppressThinkingLine(line)) continue;
-          // Word-wrap each line
-          const wrapped = this.wrapLine(line, contentWidth);
-          for (let i = 0; i < wrapped.length; i++) {
-            if (this.thinkingLinesPrinted >= 5) break;
-            process.stdout.write(`  ${gutter} ${chalk.gray(wrapped[i])}\n`);
-            this.thinkingLinesPrinted++;
-          }
-          if (this.thinkingLinesPrinted >= 5) break;
-        }
-        break;
-      }
       case 'action': {
         this.stopSpinner();
         this.hasVisibleOutput = true;
@@ -453,7 +376,6 @@ export class Renderer {
         this.insideToolCall = false;
         this.toolCallMarker = '';
         this.insideThoughtBlock = false;
-        this.thinkingLineLength = 0;
         break;
       case 'stream_chunk': {
         const text = event.content.replace(/\[done\]/gi, '').replace(/<done\s*\/>/gi, '');
@@ -492,32 +414,26 @@ export class Renderer {
             continue;
           }
 
-          this.stopSpinner();
-          this.hasVisibleOutput = true;
-          this.modelResponded = true;
-
-          // Detect 'Thought · ' or 'Thought:' lines and render with Thinking header + gutter format
+          // Suppress model-visible thought labels. Streaming provider reasoning is private,
+          // and final answers should not expose prompt/instruction traces.
           const thoughtMatch = trimmedLine.match(/^\+?\s*(?:Thought|Thinking)\s*[·:]\s*(.*)$/i);
           if (thoughtMatch) {
+            this.insideThoughtBlock = true;
             continue;
           }
 
-          // If we are currently inside a thought block, keep formatting lines inside the Thinking block
           if (this.insideThoughtBlock) {
-            const termWidth = process.stdout.columns || 80;
-            const contentWidth = termWidth - 8;
-            const gutter = chalk.dim('│');
-
             if (trimmedLine) {
-              const wrapped = this.wrapLine(line, contentWidth);
-              for (const w of wrapped) {
-                process.stdout.write(`  ${gutter} ${chalk.gray(w)}\n`);
-              }
+              continue;
             } else {
-              process.stdout.write(`  ${gutter}\n`);
+              this.insideThoughtBlock = false;
             }
             continue;
           }
+
+          this.stopSpinner();
+          this.hasVisibleOutput = true;
+          this.modelResponded = true;
 
           if (trimmedLine && !shouldSuppressThinkingLine(line)) {
             const ref = { value: this.insideMarkdownCodeBlock };
@@ -566,7 +482,25 @@ export class Renderer {
           filteredLines.push(line);
         }
 
-        const filteredRemaining = filteredLines.filter(l => !shouldSuppressThinkingLine(l)).join('\n');
+        const visibleRemainingLines: string[] = [];
+        let suppressThoughtBlock = this.insideThoughtBlock;
+        for (const line of filteredLines) {
+          const trimmed = line.trim();
+          const thoughtMatch = trimmed.match(/^\+?\s*(?:Thought|Thinking)\s*[·:]\s*(.*)$/i);
+          if (thoughtMatch || shouldSuppressThinkingLine(line)) {
+            suppressThoughtBlock = true;
+            continue;
+          }
+          if (suppressThoughtBlock) {
+            if (trimmed) continue;
+            suppressThoughtBlock = false;
+            continue;
+          }
+          visibleRemainingLines.push(line);
+        }
+        this.insideThoughtBlock = suppressThoughtBlock;
+
+        const filteredRemaining = visibleRemainingLines.join('\n');
         if (filteredRemaining.trim()) {
           this.stopSpinner();
           this.hasVisibleOutput = true;
@@ -840,10 +774,6 @@ export class Renderer {
         break;
       }
       case 'iteration': {
-        if (event.count === 1) {
-          this.thinkingLinesPrinted = 0;
-          this.suppressThinkingOutput = false;
-        }
         this.iterationStart = Date.now();
         this.modelResponded = false;
         this.startSpinner();

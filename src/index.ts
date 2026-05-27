@@ -49,7 +49,7 @@ function parseArgs(argv: string[]): CliArgs {
     else if (arg === '--task') args.task = argv[++index];
     else if (arg === '--debug') args.debug = true;
     else if (arg === '--max-iter') args.maxIter = Number(argv[++index]);
-    else if (arg === '--reasoning' || arg === '-r') args.reasoning = true;
+    else if (arg === '--reasoning' || arg === '-r') args.reasoning = false;
     else if (arg === '--search' || arg === '-s') args.search = true;
     else if (arg === '--version') args.version = true;
     else if (arg === '--dangerously-allow-all') args.dangerouslyAllowAll = true;

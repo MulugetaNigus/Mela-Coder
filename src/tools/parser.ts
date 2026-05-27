@@ -73,7 +73,7 @@ export function parseModelResponse(raw: string): ParseResult {
     thinking,
     toolCall,
     toolCalls: toolCall ? [toolCall] : [],
-    text: toolCall ? null : withoutTerminalTags || null,
+    text: withoutTerminalTags || null,
     isDone: /<done\s*\/>/i.test(cleaned),
     isError: errorMatch ? errorMatch[1].trim() : null
   };
@@ -132,6 +132,7 @@ export function parseMelaResponse(raw: string, knownTools?: Set<string>): ParseR
   const singleMatches = Array.from(cleaned.matchAll(SINGLE_FENCED_TOOL_RE));
   const matches = [...tripleMatches, ...singleMatches];
   const toolCalls: ParsedToolCall[] = [];
+  const toolSpans: Array<[number, number]> = [];
 
   if (matches.length > 0) {
     for (const match of matches) {
@@ -147,14 +148,21 @@ export function parseMelaResponse(raw: string, knownTools?: Set<string>): ParseR
            'md', 'toml', 'ini', 'log', 'csv', 'jsx', 'tsx'].includes(name)) continue;
       const params = parseFencedToolParams(name, content);
       toolCalls.push({ name, params });
+      if (typeof match.index === 'number') {
+        toolSpans.push([match.index, match.index + match[0].length]);
+      }
     }
 
     if (toolCalls.length > 0) {
+      const visibleText = removeRanges(cleaned, toolSpans)
+        .replace(/\[done\]/gi, '')
+        .replace(/<done\s*\/>/gi, '')
+        .trim();
       return {
         thinking,
         toolCall: toolCalls[0],
         toolCalls,
-        text: null,
+        text: visibleText || null,
         isDone,
         isError
       };
@@ -175,6 +183,19 @@ export function parseMelaResponse(raw: string, knownTools?: Set<string>): ParseR
     isDone,
     isError
   };
+}
+
+function removeRanges(value: string, ranges: Array<[number, number]>): string {
+  if (ranges.length === 0) return value;
+  const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
+  let result = '';
+  let cursor = 0;
+  for (const [start, end] of sorted) {
+    if (start < cursor) continue;
+    result += value.slice(cursor, start);
+    cursor = end;
+  }
+  return result + value.slice(cursor);
 }
 
 export function stripParamLabel(s: string): string {

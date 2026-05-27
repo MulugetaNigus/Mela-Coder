@@ -11,14 +11,14 @@ export const executeBashTool: ToolDefinition = {
   description: 'Execute a shell command in the working directory.',
   params: [
     { name: 'cmd', type: 'string', required: true, description: 'Shell command to execute.' },
-    { name: 'timeout_ms', type: 'number', required: false, description: 'Timeout in milliseconds. Defaults to 30000.' }
+    { name: 'timeout_ms', type: 'number', required: false, description: 'Timeout in milliseconds. Defaults to 300000.' }
   ],
   async execute(params): Promise<ToolResult> {
     try {
       if (typeof params.cmd !== 'string') throw new Error('cmd must be a string');
       const cmd = params.cmd;
 
-      const timeoutMs = typeof params.timeout_ms === 'number' ? params.timeout_ms : 30000;
+      const timeoutMs = typeof params.timeout_ms === 'number' ? params.timeout_ms : 300000;
       return await new Promise<ToolResult>(resolve => {
         const child = spawn(cmd, { shell: true, cwd: process.cwd() });
         let stdout = '';

@@ -37,61 +37,83 @@ function getLineDiff(oldStr: string, newStr: string): Array<{ type: 'add' | 'rem
   return diff;
 }
 
+function visibleWidth(): number {
+  return Math.min(process.stdout.columns || 80, 120);
+}
+
+function truncateLine(line: string, maxWidth: number): string {
+  if (line.length <= maxWidth) return line;
+  return `${line.slice(0, Math.max(maxWidth - 1, 0))}…`;
+}
+
+function colorBand(kind: 'add' | 'remove' | 'same', text: string): string {
+  if (kind === 'add') return `\x1b[48;5;22m\x1b[38;5;121m${text}\x1b[0m`;
+  if (kind === 'remove') return `\x1b[48;5;52m\x1b[38;5;203m${text}\x1b[0m`;
+  return `\x1b[2m${text}\x1b[0m`;
+}
+
+function renderChangePreview(oldContent: string, newContent: string, filePath: string): boolean {
+  const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+  const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
+  const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
+  const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
+
+  const diffs = getLineDiff(oldContent, newContent);
+  const changed = diffs.some(d => d.type !== 'same');
+  if (!changed) {
+    process.stdout.write(`  ${dim('No changes detected in')} ${cyan(filePath)}\n`);
+    return false;
+  }
+
+  const added = diffs.filter(d => d.type === 'add').length;
+  const removed = diffs.filter(d => d.type === 'remove').length;
+  const action = oldContent ? 'Edited' : 'Created';
+  process.stdout.write(`\n  ${green('•')} ${green(action)} ${cyan(filePath)} ${dim(`(+${added} -${removed})`)}\n`);
+
+  const width = visibleWidth();
+  const lineNoWidth = String(Math.max(oldContent.split(/\r?\n/).length, newContent.split(/\r?\n/).length)).length;
+  const textWidth = Math.max(width - lineNoWidth - 9, 24);
+  let oldLine = 1;
+  let newLine = 1;
+  let sameCount = 0;
+
+  for (const part of diffs) {
+    if (part.type === 'same') {
+      sameCount++;
+      if (sameCount > 2) {
+        if (sameCount === 3) process.stdout.write(`  ${dim(' '.repeat(lineNoWidth + 4) + '...')}\n`);
+        oldLine++;
+        newLine++;
+        continue;
+      }
+    } else {
+      sameCount = 0;
+    }
+
+    const lineNo = part.type === 'add' ? newLine : oldLine;
+    const sign = part.type === 'add' ? '+' : part.type === 'remove' ? '-' : ' ';
+    const number = String(lineNo).padStart(lineNoWidth, ' ');
+    const prefix = `${number} ${sign} `;
+    const body = truncateLine(part.text, textWidth).padEnd(textWidth, ' ');
+
+    process.stdout.write(`  ${colorBand(part.type, `${prefix}${body}`)}\n`);
+
+    if (part.type !== 'add') oldLine++;
+    if (part.type !== 'remove') newLine++;
+  }
+  return true;
+}
+
 export async function promptDiff(
   oldContent: string,
   newContent: string,
   filePath: string
 ): Promise<DiffDecision> {
-  if (autoApply) return 'apply';
   const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
-  const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
-
-  // New files: auto-approve without interactive prompt
-  if (!oldContent) {
-    process.stdout.write(`  ${dim('Creating new file:')} ${cyan(filePath)}\n`);
-    return 'apply';
-  }
 
   Renderer.stopActiveSpinner();
-
-  const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
-  const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
-  const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
-  const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
-
-  const diffs = getLineDiff(oldContent, newContent);
-  const changed = diffs.some(d => d.type !== 'same');
-
-  if (!changed) {
-    process.stdout.write(`  ${dim('No changes detected in')} ${cyan(filePath)}\n`);
-    return 'apply';
-  }
-
-  // Print boxed header and diff
-  const border = dim('─'.repeat(Math.min(process.stdout.columns || 80, 80)));
-  process.stdout.write(`\n  ${border}\n`);
-  process.stdout.write(`  ${bold('Pending Changes in:')} ${cyan(filePath)}\n`);
-  process.stdout.write(`  ${border}\n`);
-
-  let sameCount = 0;
-  for (const line of diffs) {
-    if (line.type === 'same') {
-      sameCount++;
-      if (sameCount <= 2) {
-        process.stdout.write(`    ${dim(' ')} ${dim(line.text)}\n`);
-      } else if (sameCount === 3) {
-        process.stdout.write(`    ${dim('... [context lines omitted]')}\n`);
-      }
-    } else {
-      sameCount = 0;
-      if (line.type === 'add') {
-        process.stdout.write(`    ${green('+')} ${green(line.text)}\n`);
-      } else {
-        process.stdout.write(`    ${red('-')} ${red(line.text)}\n`);
-      }
-    }
-  }
-  process.stdout.write(`  ${border}\n`);
+  const changed = renderChangePreview(oldContent, newContent, filePath);
+  if (!changed || autoApply) return 'apply';
 
   const options = ['Apply', 'Skip', 'Abort task'];
   let selectedIndex = 0;

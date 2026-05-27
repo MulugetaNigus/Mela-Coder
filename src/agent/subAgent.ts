@@ -52,6 +52,24 @@ const AGENT_TYPES: AgentTypeDefinition[] = [
     maxIterations: 5
   },
   {
+    agentType: 'project-scaffolder',
+    description: 'Create project directories, run scaffold commands, install dependencies, and report exact package/config state.',
+    allowedTools: ['execute_bash', 'execute_long_running', 'check_job', 'read_output', 'list_dir', 'read_file', 'set_output'],
+    maxIterations: 8
+  },
+  {
+    agentType: 'frontend-implementer',
+    description: 'Implement React/Vite UI files, CSS, components, and visual polish according to an approved design brief.',
+    allowedTools: ['read_file', 'write_file', 'edit_file', 'str_replace', 'make_dir', 'list_dir', 'glob', 'set_output'],
+    maxIterations: 12
+  },
+  {
+    agentType: 'verification-reviewer',
+    description: 'Verify generated code and package state using builds, tests, git diff, and focused source review.',
+    allowedTools: ['execute_bash', 'git_diff', 'git_status', 'show_diff', 'read_file', 'list_dir', 'search_files', 'glob', 'set_output'],
+    maxIterations: 8
+  },
+  {
     agentType: 'researcher-web',
     description: 'Search the web and fetch URL content to find information.',
     allowedTools: ['web_search', 'fetch_url', 'set_output'],
@@ -92,7 +110,9 @@ RULES:
 3. Call set_output with your final results when done. Do NOT emit <done/> — just call the tool.
 4. Keep responses brief and factual.
 5. Do NOT ask the user questions. Do NOT produce plans or outlines.
-6. Complete the task autonomously.`;
+6. Complete the task autonomously.
+7. Stay inside the assigned scope. If blocked, report the blocker and the smallest safe next step.
+8. For implementation agents, report files created/modified and verification status in set_output.`;
 }
 
 function isOutputTool(name: string): boolean {

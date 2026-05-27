@@ -244,7 +244,7 @@ export class MelaClient {
                 opts.onToken?.(chunk.token);
                 yield { text: chunk.token, done: false };
               }
-              if (chunk.reasoning) {
+              if (opts.reasoning && chunk.reasoning) {
                 opts.onReasoning?.(chunk.reasoning);
                 yield { text: '', done: false, reasoning: chunk.reasoning };
               }

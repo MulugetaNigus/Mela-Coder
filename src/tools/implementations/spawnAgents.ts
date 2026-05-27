@@ -3,9 +3,11 @@ import { getAvailableAgentTypes, type SubAgentParams } from '../../agent/subAgen
 import { MelaClient } from '../../api/melaClient';
 import { AgentDispatcher } from '../../agents/dispatcher';
 
+const SUB_AGENT_OUTPUT_PREVIEW_CHARS = 1200;
+
 export const spawnAgentsTool: ToolDefinition = {
   name: 'spawn_agents',
-  description: 'Spawn specialized sub-agents to help complete complex tasks. Each sub-agent runs independently with limited tools and reports results. Supports: file-picker, code-searcher, basher, researcher-web, researcher-docs, code-reviewer-deepseek-flash, thinker-gpt.',
+  description: 'Spawn specialized sub-agents to help complete complex tasks. Each sub-agent runs independently with limited tools and reports results. Supports: file-picker, code-searcher, basher, project-scaffolder, frontend-implementer, verification-reviewer, researcher-web, researcher-docs, code-reviewer-deepseek-flash, thinker-gpt.',
   params: [
     { name: 'agents', type: 'string', required: true, description: 'JSON stringified array of { agent_type: string, prompt: string, params?: object } objects. Each agent runs independently.' }
   ],
@@ -47,8 +49,8 @@ export const spawnAgentsTool: ToolDefinition = {
 
         if (res.success) {
           lines.push(`  [ok] Success`);
-          const outputPreview = res.output.length > 500
-            ? res.output.slice(0, 500) + `\n  [${res.output.length - 500} more chars]`
+          const outputPreview = res.output.length > SUB_AGENT_OUTPUT_PREVIEW_CHARS
+            ? res.output.slice(0, SUB_AGENT_OUTPUT_PREVIEW_CHARS) + `\n  [${res.output.length - SUB_AGENT_OUTPUT_PREVIEW_CHARS} more chars]`
             : res.output;
           if (outputPreview) {
             lines.push(`  Output: ${outputPreview}`);
@@ -93,6 +95,15 @@ export const getAgentTypesTool: ToolDefinition = {
 
 function mapTaskToAgentType(description: string, prompt: string): string {
   const text = `${description} ${prompt}`.toLowerCase();
+  if (/\b(scaffold|bootstrap|create project|vite|install dependencies|npm install|package\.json|dependency|dependencies)\b/.test(text)) {
+    return 'project-scaffolder';
+  }
+  if (/\b(react|tsx|jsx|component|ui|page|css|tailwind|style|responsive|auth page|login|signup|frontend)\b/.test(text)) {
+    return 'frontend-implementer';
+  }
+  if (/\b(verify|validate|review generated|check generated|build|typecheck|lint|test|audit|git diff|package state)\b/.test(text)) {
+    return 'verification-reviewer';
+  }
   if (/\b(picker|find|locate|where is|search files?|list files?|list_dir|file_info)\b/.test(text)) {
     return 'file-picker';
   }
@@ -116,7 +127,7 @@ function mapTaskToAgentType(description: string, prompt: string): string {
 
 export const dispatchSubtasksTool: ToolDefinition = {
   name: 'dispatch_subtasks',
-  description: 'Dispatch multiple sub-tasks to specialized agents concurrently. You specify a list of tasks with descriptions and prompts; the dispatcher will map them to the correct agent types (file-picker, code-searcher, basher, researcher-web, researcher-docs, code-reviewer-deepseek-flash, thinker-gpt) automatically, execute them in parallel, check for overlapping file modification conflicts, and report the merged results.',
+  description: 'Dispatch multiple sub-tasks to specialized agents concurrently. You specify a list of tasks with descriptions and prompts; the dispatcher will map them to the correct agent types (file-picker, code-searcher, basher, project-scaffolder, frontend-implementer, verification-reviewer, researcher-web, researcher-docs, code-reviewer-deepseek-flash, thinker-gpt) automatically, execute them in parallel, check for overlapping file modification conflicts, and report the merged results.',
   params: [
     {
       name: 'tasks',
@@ -169,8 +180,8 @@ export const dispatchSubtasksTool: ToolDefinition = {
 
         if (res.success) {
           lines.push(`  [ok] Success`);
-          const outputPreview = res.output.length > 500
-            ? res.output.slice(0, 500) + `\n  [${res.output.length - 500} more chars]`
+          const outputPreview = res.output.length > SUB_AGENT_OUTPUT_PREVIEW_CHARS
+            ? res.output.slice(0, SUB_AGENT_OUTPUT_PREVIEW_CHARS) + `\n  [${res.output.length - SUB_AGENT_OUTPUT_PREVIEW_CHARS} more chars]`
             : res.output;
           if (outputPreview) {
             lines.push(`  Output: ${outputPreview}`);

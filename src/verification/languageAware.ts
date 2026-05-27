@@ -270,6 +270,7 @@ export class EnhancedVerificationChain {
     if (config.testCommand) {
       steps.push({ name: 'test', command: config.testCommand, category: 'test' });
     }
+    steps.push({ name: 'diff-check', command: 'git diff --check', category: 'diff' });
 
     return steps;
   }
