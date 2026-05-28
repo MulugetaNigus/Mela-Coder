@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ToolDefinition, ToolResult } from '../registry';
-import { resolveWorkspacePath } from './toolUtils';
+import { normalizeStringInput, resolveWorkspacePath } from './toolUtils';
 
 const SEARCH_SKIP = new Set(['node_modules', '.git', 'dist']);
 
@@ -34,9 +34,10 @@ export const searchFilesTool: ToolDefinition = {
   async execute(params): Promise<ToolResult> {
     try {
       if (typeof params.pattern !== 'string') throw new Error('pattern must be a string');
+      const pattern = normalizeStringInput(params.pattern);
       const root = resolveWorkspacePath(typeof params.directory === 'string' ? params.directory : '.');
       const flags = params.case_sensitive === true ? 'g' : 'gi';
-      const regex = new RegExp(params.pattern, flags);
+      const regex = new RegExp(pattern, flags);
       const matches: string[] = [];
       let omitted = 0;
 
@@ -71,7 +72,7 @@ export const searchFilesTool: ToolDefinition = {
       }
 
       await walk(root);
-      if (!matches.length) return { success: true, output: `No matches found for '${params.pattern}'` };
+      if (!matches.length) return { success: true, output: `No matches found for '${pattern}'` };
       if (omitted) matches.push(`[${omitted} more matches omitted]`);
       return { success: true, output: matches.join('\n') };
     } catch (err: any) {

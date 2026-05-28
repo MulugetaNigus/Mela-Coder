@@ -4,8 +4,19 @@ import path from 'node:path';
 
 export const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '__pycache__']);
 
+export function normalizePathInput(input: unknown, fallback = '.'): string {
+  const raw = typeof input === 'string' && input.trim() ? input : fallback;
+  const firstLine = raw.split(/\r?\n/)[0].trim();
+  return firstLine.replace(/^["']|["']$/g, '') || fallback;
+}
+
+export function normalizeStringInput(input: unknown, fallback = ''): string {
+  const raw = typeof input === 'string' && input.trim() ? input.trim() : fallback;
+  return raw.replace(/^["'](.+)["']$/s, '$1').trim();
+}
+
 export function resolveWorkspacePath(input: unknown, fallback = '.'): string {
-  const value = typeof input === 'string' && input.trim() ? input : fallback;
+  const value = normalizePathInput(input, fallback);
   return path.resolve(process.cwd(), value);
 }
 
@@ -99,7 +110,7 @@ export async function walkFiles(root: string, visitor: (filePath: string) => Pro
 
 export async function runCommand(cmd: string, timeoutMs = 120000): Promise<{ success: boolean; output: string; code: number | null; error?: string }> {
   return new Promise(resolve => {
-    const child = spawn(cmd, { shell: true, cwd: process.cwd() });
+    const child = spawn(normalizeStringInput(cmd), { shell: true, cwd: process.cwd() });
     let stdout = '';
     let stderr = '';
     let timedOut = false;

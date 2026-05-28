@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { ToolDefinition, ToolResult } from '../registry';
-import { cap } from './toolUtils';
+import { cap, normalizeStringInput } from './toolUtils';
 
 interface Job {
   id: string;
@@ -36,9 +36,10 @@ export const executeLongRunningTool: ToolDefinition = {
   async execute(params): Promise<ToolResult> {
     try {
       if (typeof params.cmd !== 'string') throw new Error('cmd must be a string');
+      const cmd = normalizeStringInput(params.cmd);
       const id = `job-${nextJobId++}`;
-      const child = spawn(params.cmd, { shell: true, cwd: process.cwd() });
-      const job: Job = { id, cmd: params.cmd, child, stdout: '', stderr: '', status: 'running', code: null, startedAt: new Date().toISOString() };
+      const child = spawn(cmd, { shell: true, cwd: process.cwd() });
+      const job: Job = { id, cmd, child, stdout: '', stderr: '', status: 'running', code: null, startedAt: new Date().toISOString() };
       jobs.set(id, job);
       child.stdout.on('data', chunk => {
         job.stdout += chunk.toString();
@@ -58,7 +59,7 @@ export const executeLongRunningTool: ToolDefinition = {
           }
         }, params.timeout_ms);
       }
-      return { success: true, output: `Started ${id}: ${params.cmd}` };
+      return { success: true, output: `Started ${id}: ${cmd}` };
     } catch (err: any) {
       return { success: false, output: '', error: err?.message ?? 'Failed to start background job' };
     }

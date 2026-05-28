@@ -172,6 +172,18 @@ function isModificationRequest(task: string): boolean {
   return /\b(?:fix|change|remove|add|update|modify|edit|implement|build|create|write|generate|make|refactor|debug|repair)\b/i.test(task);
 }
 
+function isDirectChatRequest(task: string): boolean {
+  const trimmed = task.trim();
+  if (!trimmed || trimmed.length > 180) return false;
+  if (isExecutionRequest(trimmed)) return false;
+  if (/[`{};]/.test(trimmed)) return false;
+  return /^(?:hi|hello|hey|yo|sup|thanks?|thank you|ok(?:ay)?|cool|nice|great|who are you|what are you|how are you|good morning|good afternoon|good evening)[.!?\s]*$/i.test(trimmed);
+}
+
+function formatMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${Math.round(ms)}ms`;
+}
+
 function isPlanApproval(task: string): boolean {
   return /^(?:\/execute|go ahead|proceed|continue|yes|y|approved?|do it|start|run it)$/i.test(task.trim());
 }
@@ -419,6 +431,49 @@ export function createAgent(config: AgentConfig): AgentSession {
       yield* yieldCacheSummary();
     }
 
+    async function* runDirectChat(): AsyncGenerator<AgentEvent> {
+      const startedAt = Date.now();
+      let firstTokenAt: number | null = null;
+      let tokens = 0;
+      const directPrompt = [
+        'You are Mela-Coder, an autonomous CLI coding agent.',
+        'You run in a terminal, inspect codebases, edit files, execute commands, and verify engineering work.',
+        'This is fast chat mode for simple non-tool messages, but your identity and persona stay Mela-Coder.',
+        'For greetings, reply briefly as Mela-Coder and offer coding help. Do not identify as a generic AI assistant or as only the Ethiopian AI Institute assistant.',
+        'Do not mention internal fast-chat mode, tools, planning, files, or implementation unless asked.',
+        '',
+        `User: ${task}`
+      ].join('\n');
+
+      yield { type: 'status', content: `fast-chat prompt ~${context.estimateTokens(directPrompt)} tokens` };
+      yield { type: 'stream_start' };
+      try {
+        for await (const chunk of client.generateStream(directPrompt, { reasoning: false, search: false })) {
+          if (chunk.text) {
+            if (firstTokenAt === null) firstTokenAt = Date.now();
+            tokens += chunk.text.length;
+            yield { type: 'stream_chunk', content: chunk.text };
+          }
+          if (chunk.status) yield { type: 'status', content: chunk.status };
+          if (chunk.done) break;
+        }
+      } catch (err: any) {
+        yield { type: 'stream_end' };
+        yield { type: 'error', message: classifyStreamError(err) };
+        return;
+      }
+      yield { type: 'stream_end' };
+      const totalMs = Date.now() - startedAt;
+      const firstTokenMsg = firstTokenAt === null ? 'no first token' : `first token ${formatMs(firstTokenAt - startedAt)}`;
+      yield { type: 'status', content: `fast-chat latency: ${firstTokenMsg}, total ${formatMs(totalMs)}, chars ${tokens}` };
+      yield* handleDone();
+    }
+
+    if (isDirectChatRequest(task)) {
+      yield* runDirectChat();
+      return;
+    }
+
     let iterations = 0;
     const MAX = config.maxIterations ?? 50;
     let hasProducedOutput = false;
@@ -427,6 +482,7 @@ export function createAgent(config: AgentConfig): AgentSession {
     let lastRawResponse = '';
     let consecutiveIdenticalResponses = 0;
     let consecutiveTextOnlyExecutionResponses = 0;
+    const runStartedAt = Date.now();
 
     // P2.3: Circuit breaker for consecutive stream failures
     let consecutiveStreamFailures = 0;
@@ -517,9 +573,12 @@ export function createAgent(config: AgentConfig): AgentSession {
         const promptTokens = context.estimateTokens(prompt);
         context.recordInputTokens(promptTokens);
         await logDebug(debug, `Prompt tokens: ${promptTokens} (System prompt: ${systemPromptTokens}, overhead: ${Math.round((systemPromptTokens / (promptTokens || 1)) * 100)}%)`);
+        yield { type: 'status', content: `prompt ~${promptTokens} tokens; system ~${systemPromptTokens} tokens; iteration ${iterations}/${MAX}` };
 
         yield { type: 'stream_start' };
         let raw = '';
+        const requestStartedAt = Date.now();
+        let firstTokenAt: number | null = null;
         const toolNames = new Set(registry.all().map(t => t.name));
         const fenceState = { value: false };
         const fileContentState = { value: false };
@@ -529,6 +588,7 @@ export function createAgent(config: AgentConfig): AgentSession {
             search: config.search ?? false,
           })) {
             if (chunk.text) {
+              if (firstTokenAt === null) firstTokenAt = Date.now();
               raw += chunk.text;
               // Stream size limit: prevent OOM from massive responses
               const MAX_RAW_CHARS = 20000;
@@ -563,6 +623,9 @@ export function createAgent(config: AgentConfig): AgentSession {
         // P2.3: Reset circuit breaker on successful stream
         consecutiveStreamFailures = 0;
         yield { type: 'stream_end' };
+        const requestMs = Date.now() - requestStartedAt;
+        const firstTokenMsg = firstTokenAt === null ? 'no first token' : `first token ${formatMs(firstTokenAt - requestStartedAt)}`;
+        yield { type: 'status', content: `model latency: ${firstTokenMsg}, stream ${formatMs(requestMs)}, total ${formatMs(Date.now() - runStartedAt)}` };
 
         const responseTokens = context.estimateTokens(raw);
         context.recordOutputTokens(responseTokens);
@@ -701,15 +764,9 @@ export function createAgent(config: AgentConfig): AgentSession {
         }
 
         if (parsed.toolCalls && parsed.toolCalls.length > 0) {
-          if (parsed.text && parsed.text.trim()) {
-            context.addTurn({ role: 'assistant', content: raw });
-            if (!isExecutionRequest(task)) {
-              yield { type: 'text', content: parsed.text };
-              yield* handleDone();
-              return;
-            }
-          } else {
-            context.addTurn({ role: 'assistant', content: raw });
+          context.addTurn({ role: 'assistant', content: raw });
+          if (parsed.text && parsed.text.trim() && !isExecutionRequest(task)) {
+            yield { type: 'text', content: parsed.text };
           }
 
           // Transition to executing state now that we have tool calls (only once per turn)
@@ -717,12 +774,17 @@ export function createAgent(config: AgentConfig): AgentSession {
             stateMachine.transition(AgentState.EXECUTING, 'tool_calls_received');
           }
 
+          let stopTurn = false;
           for (const toolCall of parsed.toolCalls) {
             const invalidFileTool = await validateFileToolCall(toolCall.name, toolCall.params);
             if (invalidFileTool) {
-              yield { type: 'text', content: invalidFileTool };
-              yield* handleDone();
-              return;
+              const toolSig = `${toolCall.name}:${JSON.stringify(toolCall.params)}`;
+              failedToolSignatures.add(toolSig);
+              const result = { success: false, output: '', error: invalidFileTool };
+              yield { type: 'tool_result', name: toolCall.name, success: false, output: invalidFileTool };
+              context.addTurn({ role: 'user', content: formatToolResult(toolCall.name, result) });
+              stopTurn = true;
+              break;
             }
 
             yield { type: 'tool_call', name: toolCall.name, params: toolCall.params };
@@ -752,6 +814,14 @@ export function createAgent(config: AgentConfig): AgentSession {
             }
 
             if (failedToolSignatures.has(toolSig)) {
+              if (isReadTool(toolCall.name)) {
+                context.addTurn({
+                  role: 'user',
+                  content: `[READ RETRY RECOVERY] The same ${toolCall.name} call failed again. Do not stop. Normalize quoted/multiline paths, remove labels like depth/start_line from the path, or use list_dir/search_files/glob to discover the correct path, then continue.`
+                });
+                lastRawResponse = '';
+                break;
+              }
               context.addTurn({
                 role: 'user',
                 content: `[TOOL RETRY BLOCKED] The exact call ${toolSig} already failed. Do not retry it. Continue the approved plan with a different command, a different tool, or a concise blocker if no safe alternative exists.`
@@ -843,6 +913,7 @@ export function createAgent(config: AgentConfig): AgentSession {
 
               // Hardened Verification Chain
               if (!config.skipVerify) {
+                stateMachine.transition(AgentState.VERIFYING, 'tool_executed');
                 yield { type: 'status', content: 'Running verification chain...' };
                 const verifyRes = await EnhancedVerificationChain.run(false, false, true);
 
@@ -862,7 +933,7 @@ export function createAgent(config: AgentConfig): AgentSession {
 
                 // Update state based on result
                 stateMachine.transition(
-                  verifyRes.passed ? AgentState.SUCCESS : AgentState.VERIFYING,
+                  verifyRes.passed ? AgentState.SUCCESS : AgentState.RETRY,
                   verifyRes.passed ? 'verification_passed' : 'verification_failed'
                 );
               }

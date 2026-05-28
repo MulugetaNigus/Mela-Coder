@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ToolDefinition, ToolResult } from '../registry';
-import { resolveWorkspacePath, SKIP_DIRS, globToRegExp } from './toolUtils';
+import { normalizeStringInput, resolveWorkspacePath, SKIP_DIRS, globToRegExp } from './toolUtils';
 
 async function getMtime(filePath: string): Promise<Date> {
   try {
@@ -21,7 +21,7 @@ export const globTool: ToolDefinition = {
   ],
   async execute(params): Promise<ToolResult> {
     try {
-      const pattern: string = typeof params.pattern === 'string' ? params.pattern : '';
+      const pattern: string = normalizeStringInput(params.pattern);
       const cwd: string = typeof params.cwd === 'string' ? params.cwd : '.';
       if (!pattern) throw new Error('pattern must be a string');
 

@@ -180,7 +180,11 @@ export class MelaClient {
         // Refresh session on retry or first use
           if (!this.sessionId || attempt > 0) {
             try {
+              const sessionStartedAt = Date.now();
               await this.createSession();
+              const msg = `Session ready in ${Date.now() - sessionStartedAt}ms`;
+              opts.onStatus?.(msg);
+              yield { text: '', done: false, status: msg };
             } catch (sessionErr: any) {
               if (isAuthError(sessionErr.message)) throw sessionErr;
               lastError = sessionErr;
@@ -196,6 +200,7 @@ export class MelaClient {
           }
         }
 
+        const streamStartedAt = Date.now();
         const res = await fetch(`${BASE_URL}/api/chat/stream`, {
           method: 'POST',
           headers: this.buildHeaders(),
@@ -206,6 +211,9 @@ export class MelaClient {
             search: opts.search ? 1 : 0,
           }),
         });
+        const connectMsg = `Stream connected in ${Date.now() - streamStartedAt}ms`;
+        opts.onStatus?.(connectMsg);
+        yield { text: '', done: false, status: connectMsg };
 
         const freshCookies = extractCookies(res.headers);
         if (freshCookies) this.cookies = mergeCookies(this.cookies, freshCookies);

@@ -43,15 +43,16 @@ export class StateMachine {
     return this.state;
   }
 
-  canTransition(to: AgentState): boolean {
-    const validDirect = TRANSITIONS.some(t => t.from === this.state && t.to === to);
-    const validWildcard = TRANSITIONS.some(t => t.from === AgentState.ANY && t.to === to);
-    return validDirect || validWildcard;
+  canTransition(to: AgentState, trigger?: string): boolean {
+    return TRANSITIONS.some(t =>
+      (t.from === this.state || t.from === AgentState.ANY) &&
+      t.to === to &&
+      (trigger === undefined || t.trigger === trigger)
+    );
   }
 
   transition(to: AgentState, trigger: string, metadata?: Record<string, unknown>): boolean {
-    const valid = this.canTransition(to) || 
-                  TRANSITIONS.some(t => t.from === AgentState.ANY && t.to === to && t.trigger === trigger);
+    const valid = this.canTransition(to, trigger);
     
     if (!valid) {
       console.warn(`Invalid state transition: ${this.state} -> ${to} via ${trigger}`);

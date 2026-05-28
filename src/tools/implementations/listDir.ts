@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import type { ToolDefinition, ToolResult } from '../registry';
-import { resolveWorkspacePath } from './toolUtils';
+import { normalizePathInput, resolveWorkspacePath } from './toolUtils';
 
 const SKIP_NAMES = new Set(['node_modules', '.git', 'dist', '__pycache__']);
 
@@ -14,7 +14,7 @@ export const listDirTool: ToolDefinition = {
   ],
   async execute(params): Promise<ToolResult> {
     try {
-      const inputPath = typeof params.path === 'string' ? params.path : '.';
+      const inputPath = normalizePathInput(params.path);
       const root = resolveWorkspacePath(inputPath);
       const depth = typeof params.depth === 'number' ? params.depth : 2;
       const lines: string[] = [];

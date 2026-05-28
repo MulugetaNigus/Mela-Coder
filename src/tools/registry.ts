@@ -36,14 +36,13 @@ export class ToolRegistry {
   toSystemPromptSchema(): string {
     return this.all()
       .map(tool => {
-        const params = tool.params
-          .map(
-            param =>
-              `  ${param.name} (${param.type}, ${param.required ? 'required' : 'optional'}): ${param.description}`
-          )
-          .join('\n');
-        return `${tool.name} : ${tool.description}\n${params}`;
+        const params = tool.params.length
+          ? tool.params
+              .map(param => `${param.name}:${param.type}${param.required ? '*' : ''}`)
+              .join(', ')
+          : 'none';
+        return `${tool.name}: ${tool.description} | params: ${params}`;
       })
-      .join('\n\n');
+      .join('\n');
   }
 }

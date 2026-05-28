@@ -365,7 +365,7 @@ export class Renderer {
         break;
       }
       case 'status':
-        if (!this.debug) break;
+        if (!this.debug && !/\b(?:retrying|retry|failed|timeout|rate limited|session creation|stream failed)\b/i.test(event.content)) break;
         this.stopSpinner();
         process.stdout.write(`  ${chalk.cyan('i')} ${chalk.dim(event.content)}\n`);
         break;

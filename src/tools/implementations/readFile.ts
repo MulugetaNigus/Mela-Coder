@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import type { ToolDefinition, ToolResult } from '../registry';
-import { resolveWorkspacePath } from './toolUtils';
+import { normalizePathInput, resolveWorkspacePath } from './toolUtils';
 
 function formatLines(lines: string[], offset: number): string {
   return lines.map((line, index) => `${String(offset + index).padStart(4, ' ')} | ${line}`).join('\n');
@@ -18,7 +18,8 @@ export const readFileTool: ToolDefinition = {
     let filePath = '';
     try {
       if (typeof params.path !== 'string') throw new Error('path must be a string');
-      filePath = resolveWorkspacePath(params.path);
+      const inputPath = normalizePathInput(params.path);
+      filePath = resolveWorkspacePath(inputPath);
       const content = await fs.readFile(filePath, 'utf8');
       const lines = content.split(/\r?\n/);
       const startLine = typeof params.start_line === 'number' ? Math.max(1, params.start_line) : undefined;
@@ -40,7 +41,7 @@ export const readFileTool: ToolDefinition = {
 
       return { success: true, output: formatLines(lines, 1) };
     } catch (err: any) {
-      if (err?.code === 'ENOENT') return { success: false, output: '', error: `File not found: ${String(params.path)}\nResolved: ${filePath}` };
+      if (err?.code === 'ENOENT') return { success: false, output: '', error: `File not found: ${normalizePathInput(params.path)}\nResolved: ${filePath}` };
       if (err?.code === 'EISDIR') return { success: false, output: '', error: 'Path is a directory. Use list_dir.' };
       return { success: false, output: '', error: err?.message ?? 'Failed to read file' };
     }

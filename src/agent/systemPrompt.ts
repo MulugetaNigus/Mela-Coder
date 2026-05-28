@@ -5,47 +5,47 @@ import type { ToolRegistry } from '../tools/registry';
 function detectWorkspaceHints(): string[] {
   const hints: string[] = [];
   const checks: Array<[string, string]> = [
-    ['package.json',        'Node.js/JavaScript/TypeScript project'],
-    ['tsconfig.json',       'TypeScript configuration present'],
-    ['tsconfig.strict.json','Strict TypeScript config present'],
-    ['pyproject.toml',      'Python project (pyproject)'],
-    ['requirements.txt',    'Python requirements present'],
-    ['uv.lock',             'uv Python package manager'],
-    ['Cargo.toml',          'Rust project'],
-    ['go.mod',              'Go project'],
-    ['pom.xml',             'Java Maven project'],
-    ['build.gradle',        'Java/Gradle project'],
-    ['Gemfile',             'Ruby project'],
-    ['composer.json',       'PHP project'],
-    ['Makefile',            'Makefile present'],
-    ['CMakeLists.txt',      'CMake C/C++ project'],
-    ['Dockerfile',          'Docker configuration present'],
-    ['docker-compose.yml',  'Docker Compose present'],
+    ['package.json', 'Node.js/JavaScript/TypeScript project'],
+    ['tsconfig.json', 'TypeScript configuration present'],
+    ['tsconfig.strict.json', 'Strict TypeScript config present'],
+    ['pyproject.toml', 'Python project (pyproject)'],
+    ['requirements.txt', 'Python requirements present'],
+    ['uv.lock', 'uv Python package manager'],
+    ['Cargo.toml', 'Rust project'],
+    ['go.mod', 'Go project'],
+    ['pom.xml', 'Java Maven project'],
+    ['build.gradle', 'Java/Gradle project'],
+    ['Gemfile', 'Ruby project'],
+    ['composer.json', 'PHP project'],
+    ['Makefile', 'Makefile present'],
+    ['CMakeLists.txt', 'CMake C/C++ project'],
+    ['Dockerfile', 'Docker configuration present'],
+    ['docker-compose.yml', 'Docker Compose present'],
     ['docker-compose.yaml', 'Docker Compose present'],
-    ['.env.example',        'Environment config template present'],
-    ['.env',                'Environment file present (do NOT read secrets)'],
-    ['README.md',           'README present'],
-    ['.github/workflows',   'GitHub Actions CI/CD present'],
-    ['tailwind.config.ts',  'Tailwind CSS (TypeScript config)'],
-    ['tailwind.config.js',  'Tailwind CSS (JS config)'],
-    ['.storybook',          'Storybook component library present'],
-    ['tokens.json',         'Design tokens file present'],
-    ['theme.ts',            'Theme file present'],
-    ['globals.css',         'Global CSS present'],
-    ['components/ui',       'shadcn/ui or component library present'],
-    ['prisma/schema.prisma','Prisma ORM present'],
-    ['drizzle.config.ts',   'Drizzle ORM present'],
-    ['next.config.ts',      'Next.js project'],
-    ['next.config.js',      'Next.js project'],
-    ['vite.config.ts',      'Vite project'],
-    ['vitest.config.ts',    'Vitest test runner'],
-    ['jest.config.ts',      'Jest test runner'],
-    ['jest.config.js',      'Jest test runner'],
-    ['biome.json',          'Biome linter/formatter'],
-    ['.eslintrc.json',      'ESLint present'],
-    ['.eslintrc.js',        'ESLint present'],
-    ['prettier.config.js',  'Prettier formatter'],
-    ['.prettierrc',         'Prettier formatter'],
+    ['.env.example', 'Environment config template present'],
+    ['.env', 'Environment file present (do NOT read secrets)'],
+    ['README.md', 'README present'],
+    ['.github/workflows', 'GitHub Actions CI/CD present'],
+    ['tailwind.config.ts', 'Tailwind CSS (TypeScript config)'],
+    ['tailwind.config.js', 'Tailwind CSS (JS config)'],
+    ['.storybook', 'Storybook component library present'],
+    ['tokens.json', 'Design tokens file present'],
+    ['theme.ts', 'Theme file present'],
+    ['globals.css', 'Global CSS present'],
+    ['components/ui', 'shadcn/ui or component library present'],
+    ['prisma/schema.prisma', 'Prisma ORM present'],
+    ['drizzle.config.ts', 'Drizzle ORM present'],
+    ['next.config.ts', 'Next.js project'],
+    ['next.config.js', 'Next.js project'],
+    ['vite.config.ts', 'Vite project'],
+    ['vitest.config.ts', 'Vitest test runner'],
+    ['jest.config.ts', 'Jest test runner'],
+    ['jest.config.js', 'Jest test runner'],
+    ['biome.json', 'Biome linter/formatter'],
+    ['.eslintrc.json', 'ESLint present'],
+    ['.eslintrc.js', 'ESLint present'],
+    ['prettier.config.js', 'Prettier formatter'],
+    ['.prettierrc', 'Prettier formatter'],
   ];
 
   for (const [file, hint] of checks) {
@@ -313,6 +313,7 @@ const y = 2;
 ---NEW---
 const x = 10;
 const y = 20;
+replace_all: true
 \`\`\`
 
 \`\`\`str_replace
@@ -325,6 +326,7 @@ export function foo() {
 export function foo(): string {
   return 'baz';
 }
+allowMultiple: true
 \`\`\`
 
 \`\`\`execute_bash
@@ -352,6 +354,7 @@ src/old-file.ts
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TOOL REGISTRY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Required parameters are marked with *. Use get_tool_definitions only if a tool call fails because a parameter name or schema is unclear.
 ${registry.toSystemPromptSchema()}`;
 
   // ─────────────────────────────────────────────────────────────────

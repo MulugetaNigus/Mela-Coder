@@ -17,10 +17,11 @@ const Login: React.FC = () => {
   };
 
   return (
-    <AuthLayout 
-      title="Sign in to your account" 
-      subtitle="Enter your details to access your dashboard"
-    >
+    <>
+      <AuthLayout 
+        title="Sign in to your account" 
+        subtitle="Enter your details to access your dashboard"
+      >
       <form onSubmit={handleSubmit} className="space-y-6">
         <div>
           <label htmlFor="email" className="block text-sm font-medium text-gray-700">
@@ -107,6 +108,7 @@ const Login: React.FC = () => {
       isOpen={isForgotPwdOpen} 
       onClose={() => setIsForgotPwdOpen(false)} 
     />
+    </>
   );
 };
 

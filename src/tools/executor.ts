@@ -9,11 +9,67 @@ export function setPermissionGate(gate: PermissionGate): void {
   activeGate = gate;
 }
 
+function normalizeScalar(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function normalizeParams(name: string, params: Record<string, unknown>): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params)) {
+    normalized[key] = normalizeScalar(value);
+  }
+
+  const alias = (target: string, aliases: string[]): void => {
+    if (normalized[target] !== undefined) return;
+    for (const key of aliases) {
+      if (normalized[key] !== undefined) {
+        normalized[target] = normalized[key];
+        return;
+      }
+    }
+  };
+
+  alias('path', ['file_path', 'filepath', 'file', 'filename', 'target_file', 'target']);
+  alias('cmd', ['command', 'shell', 'bash']);
+  alias('directory', ['dir', 'cwd', 'path']);
+  alias('cwd', ['directory', 'dir', 'path']);
+  alias('pattern', ['query', 'text', 'regex', 'glob']);
+  alias('query', ['pattern', 'text', 'search']);
+  alias('url', ['href', 'link']);
+  alias('symbol', ['name', 'identifier']);
+  alias('message', ['summary', 'content']);
+  alias('summary', ['message', 'content']);
+  alias('old_str', ['oldString', 'old_string', 'old']);
+  alias('new_str', ['newString', 'new_string', 'new']);
+  alias('oldString', ['old_str', 'old_string', 'old']);
+  alias('newString', ['new_str', 'new_string', 'new']);
+  alias('replace_all', ['replaceAll', 'allowMultiple']);
+  alias('allowMultiple', ['replace_all', 'replaceAll']);
+  alias('from', ['source', 'src']);
+  alias('to', ['destination', 'dest', 'target']);
+  alias('job_id', ['jobId', 'id']);
+  alias('start_line', ['startLine', 'start']);
+  alias('end_line', ['endLine', 'end']);
+  alias('max_chars', ['maxChars', 'limit']);
+  alias('file_glob', ['fileGlob', 'glob']);
+
+  if ((name === 'list_dir' || name === 'list_files') && typeof normalized.path !== 'string') normalized.path = '.';
+  if (name === 'task_notes' && typeof normalized.action !== 'string') normalized.action = 'read';
+
+  return normalized;
+}
+
 export async function executeTool(call: ParsedToolCall, registry: ToolRegistry): Promise<ToolResult> {
   const tool = registry.get(call.name);
   if (!tool) {
     return { success: false, output: '', error: `Unknown tool: "${call.name}"` };
   }
+  call = { ...call, params: normalizeParams(call.name, call.params) };
 
   for (const param of tool.params.filter(p => p.required)) {
     if (!(param.name in call.params)) {

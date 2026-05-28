@@ -16,7 +16,7 @@ export const executeBashTool: ToolDefinition = {
   async execute(params): Promise<ToolResult> {
     try {
       if (typeof params.cmd !== 'string') throw new Error('cmd must be a string');
-      const cmd = params.cmd;
+      const cmd = params.cmd.trim().replace(/^["'](.+)["']$/s, '$1');
 
       const timeoutMs = typeof params.timeout_ms === 'number' ? params.timeout_ms : 300000;
       return await new Promise<ToolResult>(resolve => {

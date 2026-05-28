@@ -1,6 +1,6 @@
 export interface ParsedToolCall {
   name: string;
-  params: Record<string, string | number | boolean>;
+  params: Record<string, any>;
 }
 
 export interface ParseResult {
@@ -202,6 +202,30 @@ export function stripParamLabel(s: string): string {
   return s.replace(/^(?:cmd|command|path|content|name|pattern|question|summary|old_str|new_str|old_string|new_string|oldString|newString|key|value|query|symbol|from|to|directory|cwd|url|file_glob|message)\s*[:=]\s*/i, '');
 }
 
+function stripWrappingQuotes(s: string): string {
+  const trimmed = s.trim();
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function cleanScalar(s: string): string {
+  return stripWrappingQuotes(stripParamLabel(s).trim());
+}
+
+function parseKvLines(lines: string[], base: Record<string, string | number | boolean> = {}): Record<string, string | number | boolean> {
+  const params = { ...base };
+  for (const line of lines) {
+    const kvMatch = line.match(/^\s*([A-Za-z_][\w.-]*)\s*[:=]\s*(.+)$/);
+    if (kvMatch) {
+      const [, key, val] = kvMatch;
+      params[key] = coerceValue(stripWrappingQuotes(val));
+    }
+  }
+  return params;
+}
+
 function parseFencedToolParams(name: string, content: string): Record<string, string | number | boolean> {
   const trimmed = content.trim();
 
@@ -216,7 +240,7 @@ function parseFencedToolParams(name: string, content: string): Record<string, st
   switch (name) {
     case 'write_file': {
       const lines = trimmed.split('\n');
-      const filePath = stripParamLabel(lines[0]).trim();
+      const filePath = cleanScalar(lines[0]);
       let fileContent = lines.slice(1).join('\n');
       fileContent = fileContent.replace(/^content\s*:\s*/i, '');
       return { path: filePath, content: fileContent.trim() };
@@ -224,163 +248,191 @@ function parseFencedToolParams(name: string, content: string): Record<string, st
 
     case 'edit_file': {
       const lines = trimmed.split('\n');
-      const filePath = stripParamLabel(lines[0]).trim();
+      const filePath = cleanScalar(lines[0]);
       const body = lines.slice(1).join('\n');
       const markerMatch = body.match(/(?:^|\n)---OLD---\s*\n([\s\S]*?)\n---NEW---\s*\n([\s\S]*)$/);
       if (markerMatch) {
-        return { path: filePath, old_str: markerMatch[1], new_str: markerMatch[2] };
+        let newStr = markerMatch[2];
+        const options: Record<string, string | number | boolean> = {};
+        const lines = newStr.split('\n');
+        while (lines.length > 0) {
+          const lastLine = lines[lines.length - 1].trim();
+          const optMatch = lastLine.match(/^(replace_all|allowMultiple|replaceAll)\s*[:=]\s*(true|false)(?:\s+.*)?$/i);
+          if (optMatch) {
+            let key = optMatch[1].toLowerCase();
+            if (key === 'replaceall' || key === 'replace_all') {
+              key = 'replace_all';
+            } else if (key === 'allowmultiple') {
+              key = 'allowMultiple';
+            }
+            options[key] = coerceValue(optMatch[2]);
+            lines.pop();
+          } else if (lastLine === '') {
+            lines.pop();
+          } else {
+            break;
+          }
+        }
+        newStr = lines.join('\n');
+        return { path: filePath, old_str: markerMatch[1], new_str: newStr, ...options };
       }
-      return { path: filePath, old_str: stripParamLabel(lines[1] || '').trim(), new_str: stripParamLabel(lines[2] || '').trim() };
+      return { path: filePath, old_str: cleanScalar(lines[1] || ''), new_str: cleanScalar(lines[2] || '') };
     }
 
     case 'str_replace': {
       const lines = trimmed.split('\n');
-      const filePath = stripParamLabel(lines[0]).trim();
+      const filePath = cleanScalar(lines[0]);
       const body = lines.slice(1).join('\n');
       const markerMatch = body.match(/(?:^|\n)---OLD---\s*\n([\s\S]*?)\n---NEW---\s*\n([\s\S]*)$/);
       if (markerMatch) {
-        return { path: filePath, oldString: markerMatch[1], newString: markerMatch[2] };
+        let newString = markerMatch[2];
+        const options: Record<string, string | number | boolean> = {};
+        const lines = newString.split('\n');
+        while (lines.length > 0) {
+          const lastLine = lines[lines.length - 1].trim();
+          const optMatch = lastLine.match(/^(replace_all|allowMultiple|replaceAll)\s*[:=]\s*(true|false)(?:\s+.*)?$/i);
+          if (optMatch) {
+            let key = optMatch[1].toLowerCase();
+            if (key === 'replaceall' || key === 'replace_all') {
+              key = 'replace_all';
+            } else if (key === 'allowmultiple') {
+              key = 'allowMultiple';
+            }
+            options[key] = coerceValue(optMatch[2]);
+            lines.pop();
+          } else if (lastLine === '') {
+            lines.pop();
+          } else {
+            break;
+          }
+        }
+        newString = lines.join('\n');
+        return { path: filePath, oldString: markerMatch[1], newString, ...options };
       }
-      return { path: filePath, oldString: stripParamLabel(lines[1] || '').trim(), newString: stripParamLabel(lines[2] || '').trim() };
+      return { path: filePath, oldString: cleanScalar(lines[1] || ''), newString: cleanScalar(lines[2] || '') };
     }
 
     case 'run_cmd':
     case 'execute_bash':
-      return { cmd: stripParamLabel(trimmed) };
+      return { cmd: cleanScalar(trimmed) };
 
     case 'execute_long_running': {
       // Model may output just the command, or "cmd: <command>", or multi-line
       const lines = trimmed.split('\n');
-      const firstLine = stripParamLabel(lines[0]).trim();
+      const firstLine = cleanScalar(lines[0]);
       if (lines.length === 1) return { cmd: firstLine };
-      // Multi-line: first line is cmd, rest may be timeout_ms
-      const params: Record<string, string | number | boolean> = { cmd: firstLine };
-      for (const line of lines.slice(1)) {
-        const kvMatch = line.match(/^(\w+)\s*[:=]\s*(.+)$/);
-        if (kvMatch) {
-          const [, key, val] = kvMatch;
-          params[key] = coerceValue(val);
-        }
-      }
-      return params;
+      return parseKvLines(lines.slice(1), { cmd: firstLine });
     }
 
     case 'list_dir':
-    case 'list_files':
-      return { path: stripParamLabel(trimmed) || '.' };
+    case 'list_files': {
+      const lines = trimmed.split('\n');
+      return parseKvLines(lines.slice(1), { path: cleanScalar(lines[0] || '') || '.' });
+    }
 
     case 'done':
-      return { summary: stripParamLabel(trimmed) || '' };
+      return { summary: cleanScalar(trimmed) || '' };
 
     case 'search_files':
     case 'grep': {
       const lines = trimmed.split('\n');
-      return { pattern: stripParamLabel(lines[0] || '').trim(), directory: stripParamLabel(lines[1] || '.').trim() };
+      return parseKvLines(lines.slice(2), { pattern: cleanScalar(lines[0] || ''), directory: cleanScalar(lines[1] || '.') });
     }
 
     case 'glob': {
       const lines = trimmed.split('\n');
-      return { pattern: stripParamLabel(lines[0] || '').trim(), cwd: stripParamLabel(lines[1] || '.').trim() };
+      return parseKvLines(lines.slice(2), { pattern: cleanScalar(lines[0] || ''), cwd: cleanScalar(lines[1] || '.') });
     }
 
     case 'find_symbol':
-      return { symbol: stripParamLabel(trimmed) };
+      return { symbol: cleanScalar(trimmed) };
 
     case 'semantic_search':
-      return { query: stripParamLabel(trimmed) };
+      return { query: cleanScalar(trimmed) };
 
     case 'ask_user':
-      return { question: stripParamLabel(trimmed) };
+      return { question: cleanScalar(trimmed) };
 
     case 'read_file': {
       const lines = trimmed.split('\n');
-      const filePath = stripParamLabel(lines[0]).trim();
-      const params: Record<string, string | number | boolean> = { path: filePath };
-      for (let i = 1; i < lines.length; i++) {
-        const kvMatch = lines[i].match(/^\s*(\w+)\s*:\s*(.+)$/);
-        if (kvMatch) {
-          const [, key, val] = kvMatch;
-          params[key] = coerceValue(val.trim());
-        }
-      }
-      return params;
+      return parseKvLines(lines.slice(1), { path: cleanScalar(lines[0]) });
     }
 
     case 'delete_file':
     case 'make_dir':
-      return { path: stripParamLabel(trimmed) };
+      return { path: cleanScalar(trimmed) };
 
     case 'copy_file':
     case 'rename_file': {
       const lines = trimmed.split('\n');
-      return { from: stripParamLabel(lines[0] || '').trim(), to: stripParamLabel(lines[1] || '').trim() };
+      return parseKvLines(lines.slice(2), { from: cleanScalar(lines[0] || ''), to: cleanScalar(lines[1] || '') });
     }
 
     case 'remember': {
       const lines = trimmed.split('\n');
-      return { key: stripParamLabel(lines[0] || '').trim(), value: stripParamLabel(lines.slice(1).join('\n')).trim() };
+      return { key: cleanScalar(lines[0] || ''), value: cleanScalar(lines.slice(1).join('\n')) };
     }
 
     case 'recall':
-      return { query: stripParamLabel(trimmed) };
+      return { query: cleanScalar(trimmed) };
 
     case 'web_search':
-      return { query: stripParamLabel(trimmed) };
+      return { query: cleanScalar(trimmed) };
 
     case 'fetch_url':
     case 'read_github_issue':
     case 'read_github_file':
-      return { url: stripParamLabel(trimmed) };
+      return { url: cleanScalar(trimmed) };
 
     case 'git_commit':
-      return { message: stripParamLabel(trimmed) };
+      return { message: cleanScalar(trimmed) };
 
     case 'git_create_branch':
-      return { name: stripParamLabel(trimmed) };
+      return { name: cleanScalar(trimmed) };
 
     case 'file_info':
-      return { path: stripParamLabel(trimmed) };
+      return { path: cleanScalar(trimmed) };
 
     case 'find_files': {
       const lines = trimmed.split('\n');
-      return { pattern: stripParamLabel(lines[0] || '').trim(), directory: stripParamLabel(lines[1] || '.').trim() };
+      return parseKvLines(lines.slice(2), { pattern: cleanScalar(lines[0] || ''), directory: cleanScalar(lines[1] || '.') });
     }
 
     case 'show_diff':
-      return { path: stripParamLabel(trimmed) };
+      return { path: cleanScalar(trimmed) };
 
     case 'summarize_context':
-      return { content: stripParamLabel(trimmed) };
+      return { content: cleanScalar(trimmed) };
 
     case 'get_definition':
     case 'get_references':
-      return { symbol: stripParamLabel(trimmed) };
+      return { symbol: cleanScalar(trimmed) };
 
     case 'spawn_agents':
     case 'spawn_agent':
-      return { agents: stripParamLabel(trimmed) };
+      return { agents: cleanScalar(trimmed) };
 
     case 'task_notes':
-      return { action: 'read', content: stripParamLabel(trimmed) };
+      return parseKvLines(trimmed.split('\n'), { action: 'read', content: cleanScalar(trimmed) });
 
     case 'write_todos':
-      return { todos: stripParamLabel(trimmed) };
+      return { todos: cleanScalar(trimmed) };
 
     case 'suggest_followups':
-      return { followups: stripParamLabel(trimmed) };
+      return { followups: cleanScalar(trimmed) };
 
     default: {
       // Try to extract known param patterns: "cmd: value", "path: value", etc.
       const kvMatch = trimmed.match(/^(cmd|command|path|file_path|query|url|pattern|message|symbol|key|name)\s*[:=]\s*([\s\S]+)$/i);
       if (kvMatch) {
-        return { [kvMatch[1].toLowerCase()]: coerceValue(kvMatch[2]) };
+        return { [kvMatch[1].toLowerCase()]: coerceValue(stripWrappingQuotes(kvMatch[2])) };
       }
       // Fallback: treat entire content as 'cmd' for command-like tools, or 'content' for others
       if (name.includes('execute') || name.includes('run') || name.includes('bash') || name.includes('cmd') || name.includes('shell') || name.includes('job') || name.includes('long')) {
-        return { cmd: stripParamLabel(trimmed) };
+        return { cmd: cleanScalar(trimmed) };
       }
       if (typeof trimmed === 'string' && trimmed) {
-        return { content: stripParamLabel(trimmed) };
+        return { content: cleanScalar(trimmed) };
       }
       return {};
     }
